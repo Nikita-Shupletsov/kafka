@@ -18,7 +18,9 @@ package org.apache.kafka.clients.consumer.internals;
 
 import org.apache.kafka.common.MetricNameTemplate;
 import org.apache.kafka.common.metrics.Metrics;
+import org.apache.kafka.common.metrics.internals.LatencyPercentiles;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
@@ -39,6 +41,7 @@ public class FetchMetricsRegistry {
     public MetricNameTemplate recordsConsumedTotal;
     public MetricNameTemplate fetchLatencyAvg;
     public MetricNameTemplate fetchLatencyMax;
+    public LatencyPercentiles.Templates fetchLatencyDistribution;
     public MetricNameTemplate fetchRequestRate;
     public MetricNameTemplate fetchRequestTotal;
     public MetricNameTemplate recordsLagMax;
@@ -94,6 +97,8 @@ public class FetchMetricsRegistry {
                 "The average time taken for a fetch request.", tags);
         this.fetchLatencyMax = new MetricNameTemplate("fetch-latency-max", groupName,
                 "The max time taken for any fetch request.", tags);
+        this.fetchLatencyDistribution = LatencyPercentiles.templates("fetch-latency", groupName,
+                "the time taken for a fetch request", tags);
         this.fetchRequestRate = new MetricNameTemplate("fetch-rate", groupName,
                 "The number of fetch requests per second.", tags);
         this.fetchRequestTotal = new MetricNameTemplate("fetch-total", groupName,
@@ -157,7 +162,7 @@ public class FetchMetricsRegistry {
     }
 
     public List<MetricNameTemplate> getAllTemplates() {
-        return Arrays.asList(
+        List<MetricNameTemplate> templates = new ArrayList<>(Arrays.asList(
             fetchSizeAvg,
             fetchSizeMax,
             bytesConsumedRate,
@@ -166,7 +171,9 @@ public class FetchMetricsRegistry {
             recordsConsumedRate,
             recordsConsumedTotal,
             fetchLatencyAvg,
-            fetchLatencyMax,
+            fetchLatencyMax));
+        templates.addAll(fetchLatencyDistribution.all());
+        templates.addAll(Arrays.asList(
             fetchRequestRate,
             fetchRequestTotal,
             recordsLagMax,
@@ -187,7 +194,8 @@ public class FetchMetricsRegistry {
             partitionRecordsLeadMin,
             partitionRecordsLeadAvg,
             partitionPreferredReadReplica
-        );
+        ));
+        return templates;
     }
 
 }

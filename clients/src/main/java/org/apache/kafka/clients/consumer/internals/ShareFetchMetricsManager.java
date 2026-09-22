@@ -62,6 +62,7 @@ public class ShareFetchMetricsManager extends AbstractConsumerMetricsManager {
                 .withAvg(metricsRegistry.fetchLatencyAvg)
                 .withMax(metricsRegistry.fetchLatencyMax)
                 .withMeter(new WindowedCount(), metricsRegistry.fetchRequestRate, metricsRegistry.fetchRequestTotal)
+                .withPercentiles(metricsRegistry.fetchLatencyDistribution)
                 .build();
 
         this.throttleTime = new SensorBuilder(metrics, "fetch-throttle-time")

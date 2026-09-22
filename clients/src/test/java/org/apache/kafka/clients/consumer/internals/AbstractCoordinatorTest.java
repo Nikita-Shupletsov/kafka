@@ -39,6 +39,7 @@ import org.apache.kafka.common.message.SyncGroupRequestData;
 import org.apache.kafka.common.message.SyncGroupResponseData;
 import org.apache.kafka.common.metrics.KafkaMetric;
 import org.apache.kafka.common.metrics.Metrics;
+import org.apache.kafka.common.metrics.internals.LatencyPercentilesTest;
 import org.apache.kafka.common.protocol.ApiKeys;
 import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.common.requests.AbstractRequest;
@@ -201,6 +202,8 @@ public class AbstractCoordinatorTest {
         assertNotNull(getMetric("rebalance-latency-avg"));
         assertNotNull(getMetric("rebalance-latency-max"));
         assertNotNull(getMetric("rebalance-latency-total"));
+        LatencyPercentilesTest.assertLatencyDistributionRegistered(metrics, "rebalance-latency",
+            "consumer-coordinator-metrics", Map.of());
         assertNotNull(getMetric("rebalance-rate-per-hour"));
         assertNotNull(getMetric("rebalance-total"));
         assertNotNull(getMetric("last-rebalance-seconds-ago"));

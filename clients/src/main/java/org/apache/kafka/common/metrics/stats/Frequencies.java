@@ -139,8 +139,7 @@ public class Frequencies extends SampledStat implements CompoundStat {
         float count = 0.0f;
         int binNum = binScheme.toBin(centerValue);
         for (Sample s : samples) {
-            HistogramSample sample = (HistogramSample) s;
-            float[] hist = sample.histogram.counts();
+            float[] hist = ((Histogram) ((HistogramSample) s).store).counts();
             count += hist[binNum];
         }
         // Compute the ratio of counts to total counts
@@ -161,29 +160,12 @@ public class Frequencies extends SampledStat implements CompoundStat {
     }
 
     @Override
-    protected HistogramSample newSample(long timeMs) {
-        return new HistogramSample(binScheme, timeMs);
+    protected Sample newSample(long timeMs) {
+        return new HistogramSample(new Histogram(binScheme), timeMs);
     }
 
     @Override
     protected void update(Sample sample, MetricConfig config, double value, long timeMs) {
-        HistogramSample hist = (HistogramSample) sample;
-        hist.histogram.record(value);
-    }
-
-    private static class HistogramSample extends SampledStat.Sample {
-
-        private final Histogram histogram;
-
-        private HistogramSample(BinScheme scheme, long now) {
-            super(0.0, now);
-            histogram = new Histogram(scheme);
-        }
-
-        @Override
-        public void reset(long now) {
-            super.reset(now);
-            histogram.clear();
-        }
+        ((HistogramSample) sample).store.record(value);
     }
 }

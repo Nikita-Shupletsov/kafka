@@ -20,6 +20,7 @@ package org.apache.kafka.common.metrics;
 import org.apache.kafka.common.MetricName;
 import org.apache.kafka.common.annotation.InterfaceAudience;
 
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -29,27 +30,55 @@ import java.util.List;
 @InterfaceAudience.Public
 public interface CompoundStat extends Stat {
 
+    /**
+     * The numeric ({@link Measurable}) metrics this stat feeds.
+     */
     List<NamedMeasurable> stats();
 
-    class NamedMeasurable {
+    /**
+     * The named metrics this stat feeds, each with its {@link MetricValueProvider} (numeric or not).
+     * Registered by {@code Sensor.add(CompoundStat)}. Defaults to {@link #stats()}; override only to also
+     * feed non-numeric metrics (e.g. a raw histogram distribution), otherwise the numeric {@link #stats()}
+     * are exposed unchanged.
+     */
+    default List<NamedMetricValueProvider> providers() {
+        return new ArrayList<>(stats());
+    }
+
+    /**
+     * A named metric with its value provider, which may be numeric or not.
+     */
+    class NamedMetricValueProvider {
 
         private final MetricName name;
-        private final Measurable stat;
+        private final MetricValueProvider<?> metricValueProvider;
 
-        public NamedMeasurable(MetricName name, Measurable stat) {
-            super();
+        public NamedMetricValueProvider(MetricName name, MetricValueProvider<?> metricValueProvider) {
             this.name = name;
-            this.stat = stat;
+            this.metricValueProvider = metricValueProvider;
         }
 
         public MetricName name() {
             return name;
         }
 
-        public Measurable stat() {
-            return stat;
+        public MetricValueProvider<?> metricValueProvider() {
+            return metricValueProvider;
+        }
+    }
+
+    /**
+     * A {@link NamedMetricValueProvider} whose value provider is a {@link Measurable} (numeric).
+     */
+    class NamedMeasurable extends NamedMetricValueProvider {
+
+        public NamedMeasurable(MetricName name, Measurable stat) {
+            super(name, stat);
         }
 
+        public Measurable stat() {
+            return (Measurable) metricValueProvider();
+        }
     }
 
 }

@@ -53,6 +53,16 @@ public interface ClientTelemetrySender extends AutoCloseable {
     Optional<Builder<?>> createRequest();
 
     /**
+     * Record the highest PushTelemetry version of the broker the next request from {@link #createRequest()} goes
+     * to, called right before it. A push carries histogram metrics, and is split into parts, only for a broker that
+     * supports PushTelemetry version 1 or later.
+     *
+     * @param pushTelemetryVersion the broker's highest PushTelemetry version, or -1 if it is not known
+     */
+    default void telemetryBrokerVersion(short pushTelemetryVersion) {
+    }
+
+    /**
      * Handle successful response for get telemetry subscriptions request.
      *
      * @param response subscriptions telemetry API response

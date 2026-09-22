@@ -19,6 +19,7 @@ package org.apache.kafka.clients.consumer.internals.metrics;
 import org.apache.kafka.common.Metric;
 import org.apache.kafka.common.MetricNameTemplate;
 import org.apache.kafka.common.metrics.Sensor;
+import org.apache.kafka.common.metrics.internals.LatencyPercentiles;
 import org.apache.kafka.common.metrics.stats.Avg;
 import org.apache.kafka.common.metrics.stats.Max;
 import org.apache.kafka.common.metrics.stats.Meter;
@@ -87,6 +88,19 @@ public class SensorBuilder {
     public SensorBuilder withValue(MetricNameTemplate name) {
         if (!preexisting)
             sensor.add(metrics.metricInstance(name, tags), new Value());
+
+        return this;
+    }
+
+    /**
+     * Add the standard latency distribution (KIP-714 client telemetry) declared by {@code templates}: the numeric
+     * percentiles plus the raw {@code -histogram} distribution the telemetry collector emits.
+     */
+    public SensorBuilder withPercentiles(LatencyPercentiles.Templates templates) {
+        if (!preexisting) {
+            LatencyPercentiles.addTo(sensor, templates.instantiate(template -> metrics.metricInstance(template, tags)),
+                metrics.config());
+        }
 
         return this;
     }

@@ -362,25 +362,28 @@ public class CoordinatorRuntimeMetricsImplTest {
             }
         });
 
+        // max is exact (tracked by a Max stat, not binned).
         MetricName metricName = kafkaMetricName(metrics, metricNamePrefix + "-max");
         KafkaMetric metric = metrics.metrics().get(metricName);
         assertEquals(1000.0, metric.metricValue());
 
+        // Percentiles come from geometric (log-scale) bins with 0.25% relative width, so each is
+        // accurate to roughly a bin edge; assert within two bins rather than exactly.
         metricName = kafkaMetricName(metrics, metricNamePrefix + "-p50");
         metric = metrics.metrics().get(metricName);
-        assertEquals(500.0, metric.metricValue());
+        assertEquals(500.0, (Double) metric.metricValue(), 500.0 * 0.005);
 
         metricName = kafkaMetricName(metrics, metricNamePrefix + "-p95");
         metric = metrics.metrics().get(metricName);
-        assertEquals(950.0, metric.metricValue());
+        assertEquals(950.0, (Double) metric.metricValue(), 950.0 * 0.005);
 
         metricName = kafkaMetricName(metrics, metricNamePrefix + "-p99");
         metric = metrics.metrics().get(metricName);
-        assertEquals(990.0, metric.metricValue());
+        assertEquals(990.0, (Double) metric.metricValue(), 990.0 * 0.005);
 
         metricName = kafkaMetricName(metrics, metricNamePrefix + "-p999");
         metric = metrics.metrics().get(metricName);
-        assertEquals(999.0, metric.metricValue());
+        assertEquals(999.0, (Double) metric.metricValue(), 999.0 * 0.005);
     }
 
 
@@ -397,8 +400,8 @@ public class CoordinatorRuntimeMetricsImplTest {
         KafkaMetric metric = metrics.metrics().get(metricName);
         long value = ((Double) metric.metricValue()).longValue();
 
-        // 3 sigfigs in HdrHistogram is not precise enough.
-        assertTrue(value >= MAX_LATENCY_MS && value < MAX_LATENCY_MS + 1000L);
+        // The max is exact, and values above the cap are recorded as the cap.
+        assertEquals(MAX_LATENCY_MS, value);
     }
 
     private static void assertMetricGauge(Metrics metrics, org.apache.kafka.common.MetricName metricName, long count) {

@@ -46,6 +46,7 @@ import org.apache.kafka.common.message.SyncGroupRequestData;
 import org.apache.kafka.common.metrics.Measurable;
 import org.apache.kafka.common.metrics.Metrics;
 import org.apache.kafka.common.metrics.Sensor;
+import org.apache.kafka.common.metrics.internals.LatencyPercentiles;
 import org.apache.kafka.common.metrics.stats.Avg;
 import org.apache.kafka.common.metrics.stats.CumulativeCount;
 import org.apache.kafka.common.metrics.stats.CumulativeSum;
@@ -1404,6 +1405,10 @@ public abstract class AbstractCoordinator implements Closeable {
                 this.metricGrpName,
                 "The total number of milliseconds this consumer has spent in successful rebalances since creation"),
                 new CumulativeSum());
+            LatencyPercentiles.addTo(this.successfulRebalanceSensor,
+                metrics.metricName("rebalance-latency", this.metricGrpName,
+                    "The distribution of time in ms taken for a group to complete a successful rebalance"),
+                metrics.config());
             this.successfulRebalanceSensor.add(
                 metrics.metricName("rebalance-total",
                     this.metricGrpName,

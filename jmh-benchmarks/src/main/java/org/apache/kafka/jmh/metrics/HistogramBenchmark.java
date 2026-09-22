@@ -16,11 +16,16 @@
  */
 package org.apache.kafka.jmh.metrics;
 
-import org.apache.kafka.coordinator.common.runtime.HdrHistogram;
+import org.apache.kafka.common.MetricName;
+import org.apache.kafka.common.metrics.KafkaMetric;
+import org.apache.kafka.common.metrics.Metrics;
+import org.apache.kafka.common.metrics.Sensor;
+import org.apache.kafka.common.metrics.stats.Percentile;
+import org.apache.kafka.common.metrics.stats.Percentiles;
+import org.apache.kafka.common.metrics.stats.Percentiles.BucketSizing;
 import org.apache.kafka.server.metrics.KafkaYammerMetrics;
 
 import com.yammer.metrics.core.Histogram;
-import com.yammer.metrics.core.MetricName;
 
 import org.openjdk.jmh.annotations.Benchmark;
 import org.openjdk.jmh.annotations.BenchmarkMode;
@@ -34,6 +39,7 @@ import org.openjdk.jmh.annotations.OutputTimeUnit;
 import org.openjdk.jmh.annotations.Scope;
 import org.openjdk.jmh.annotations.Setup;
 import org.openjdk.jmh.annotations.State;
+import org.openjdk.jmh.annotations.TearDown;
 import org.openjdk.jmh.annotations.Threads;
 import org.openjdk.jmh.annotations.Warmup;
 
@@ -51,22 +57,47 @@ public class HistogramBenchmark {
 
     /*
      * This benchmark compares the performance of the most commonly used in the Kafka codebase
-     * Yammer histogram and the new HdrHistogram. It does it by focusing on the write path in a
-     * multiple writers, multiple readers scenario.
+     * Yammer histogram and the Kafka Metrics framework histogram ({@link Percentiles}), which now
+     * backs the coordinator latency histograms. It focuses on the write path in a multiple-writers,
+     * multiple-readers scenario.
      *
-     * The benchmark relies on JMH Groups which allows us to distribute the number of worker threads
-     * to the different benchmark methods.
+     * For a fair comparison both sides are exercised as they are in production: the Yammer histogram
+     * is thread-safe on its own, and the framework {@link Percentiles} is recorded and read through a
+     * {@link Sensor}/{@link KafkaMetric}, which is how the framework serializes concurrent records and
+     * reads (a bare Percentiles is NOT thread-safe). Bucket layout matches KafkaMetricHistogram:
+     * geometric buckets over [1ms, MAX_VALUE] at 0.25% relative error.
+     *
+     * The benchmark relies on JMH Groups to distribute the worker threads across the benchmark methods.
      */
 
+    private static final double MIN_VALUE = 1.0;
     private static final long MAX_VALUE = TimeUnit.MINUTES.toMillis(1L);
+    private static final double RELATIVE_ERROR = 0.0025;
+    // Number of geometric buckets to cover [MIN_VALUE, MAX_VALUE] at RELATIVE_ERROR per bucket — the same
+    // count KafkaMetricHistogram.bucketsFor(...) produces (~4407).
+    private static final int BUCKETS = (int) Math.ceil(Math.log(MAX_VALUE / MIN_VALUE) / Math.log(1 + RELATIVE_ERROR));
 
+    private Metrics metrics;
+    private Sensor frameworkSensor;
+    private KafkaMetric frameworkP999;
     private Histogram yammerHistogram;
-    private HdrHistogram hdrHistogram;
 
     @Setup(Level.Trial)
     public void setUp() {
-        yammerHistogram = KafkaYammerMetrics.defaultRegistry().newHistogram(new MetricName("a", "", ""), true);
-        hdrHistogram = new HdrHistogram(MAX_VALUE, 3);
+        yammerHistogram = KafkaYammerMetrics.defaultRegistry().newHistogram(new com.yammer.metrics.core.MetricName("a", "", ""), true);
+
+        metrics = new Metrics();
+        MetricName p999 = metrics.metricName("latency-p999", "bench");
+        frameworkSensor = metrics.sensor("latency");
+        // Percentiles sizes its buckets as bytes/4; give it BUCKETS buckets to match KafkaMetricHistogram.
+        frameworkSensor.add(new Percentiles(BUCKETS * 4, MIN_VALUE, MAX_VALUE, BucketSizing.EXPONENTIAL,
+            new Percentile(p999, 99.9)));
+        frameworkP999 = metrics.metric(p999);
+    }
+
+    @TearDown(Level.Trial)
+    public void tearDown() {
+        metrics.close();
     }
 
     /*
@@ -85,8 +116,8 @@ public class HistogramBenchmark {
     @Benchmark
     @Group("runner")
     @GroupThreads(3)
-    public void writeHdrHistogram() {
-        hdrHistogram.record(ThreadLocalRandom.current().nextLong(MAX_VALUE));
+    public void writeFrameworkHistogram() {
+        frameworkSensor.record(ThreadLocalRandom.current().nextLong(MAX_VALUE));
     }
 
     /*
@@ -112,10 +143,10 @@ public class HistogramBenchmark {
     @Benchmark
     @Group("runner")
     @GroupThreads(2)
-    public double readHdrHistogram() {
+    public double readFrameworkHistogram() {
         long now = System.currentTimeMillis();
         if (now % 199 == 0) {
-            return hdrHistogram.measurePercentile(now, 99.9);
+            return (Double) frameworkP999.metricValue();
         }
         return now;
     }

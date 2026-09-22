@@ -21,6 +21,7 @@ import org.apache.kafka.common.MetricNameTemplate;
 import org.apache.kafka.common.metrics.KafkaMetric;
 import org.apache.kafka.common.metrics.Metrics;
 import org.apache.kafka.common.metrics.Sensor;
+import org.apache.kafka.common.metrics.internals.LatencyPercentilesTest;
 import org.apache.kafka.common.metrics.stats.Avg;
 import org.apache.kafka.common.metrics.stats.Max;
 import org.apache.kafka.common.utils.MockTime;
@@ -31,6 +32,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
+import java.util.Map;
 
 import static org.apache.kafka.clients.consumer.internals.ConsumerUtils.CONSUMER_SHARE_METRIC_GROUP_PREFIX;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -69,6 +71,12 @@ class ShareFetchMetricsManagerTest {
 
         assertEquals(155, (double) getMetric(shareFetchMetricsRegistry.fetchLatencyMax).metricValue(), EPSILON);
         assertEquals(128, (double) getMetric(shareFetchMetricsRegistry.fetchLatencyAvg).metricValue(), EPSILON);
+    }
+
+    @Test
+    public void testLatencyDistributionIsRegistered() {
+        LatencyPercentilesTest.assertLatencyDistributionRegistered(metrics, "fetch-latency",
+            shareFetchMetricsRegistry.fetchLatencyAvg.group(), Map.of());
     }
 
     @Test

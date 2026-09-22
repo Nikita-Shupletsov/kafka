@@ -464,6 +464,42 @@ public class MetricsTest {
     }
 
     @Test
+    public void testPercentilesWithExponentialBucketing() {
+        // Exponential (log-scale) bins keep uniform relative precision across a wide range, so
+        // latency-like values spanning several orders of magnitude get accurate percentiles without
+        // a pre-declared linear range collapsing the low end.
+        int buckets = 1000;
+        Percentiles percs = new Percentiles(4 * buckets,
+                                            1.0,
+                                            1_000_000.0,
+                                            BucketSizing.EXPONENTIAL,
+                                            new Percentile(metrics.metricName("test.p25", "grp1"), 25),
+                                            new Percentile(metrics.metricName("test.p50", "grp1"), 50),
+                                            new Percentile(metrics.metricName("test.p99", "grp1"), 99));
+        MetricConfig config = new MetricConfig().eventWindow(2000).samples(2);
+        Sensor sensor = metrics.sensor("test", config);
+        sensor.add(percs);
+        Metric p25 = this.metrics.metrics().get(metrics.metricName("test.p25", "grp1"));
+        Metric p50 = this.metrics.metrics().get(metrics.metricName("test.p50", "grp1"));
+        Metric p99 = this.metrics.metrics().get(metrics.metricName("test.p99", "grp1"));
+
+        // record 1000 sequential values (1..1000)
+        for (int i = 1; i <= buckets; i++)
+            sensor.record(i);
+
+        assertEquals(250.0, (Double) p25.metricValue(), 250.0 * 0.05);
+        assertEquals(500.0, (Double) p50.metricValue(), 500.0 * 0.05);
+        assertEquals(990.0, (Double) p99.metricValue(), 990.0 * 0.05);
+    }
+
+    @Test
+    public void exponentialBucketingRequiresPositiveMin() {
+        assertThrows(IllegalArgumentException.class,
+            () -> new Percentiles(4000, 0.0, 100.0, BucketSizing.EXPONENTIAL,
+                new Percentile(metrics.metricName("test.p50", "grp1"), 50)));
+    }
+
+    @Test
     public void shouldPinSmallerValuesToMin() {
         final double min = 0.0d;
         final double max = 100d;

@@ -18,6 +18,7 @@ package org.apache.kafka.common.metrics.stats;
 
 import org.apache.kafka.common.metrics.stats.Histogram.BinScheme;
 import org.apache.kafka.common.metrics.stats.Histogram.ConstantBinScheme;
+import org.apache.kafka.common.metrics.stats.Histogram.ExponentialBinScheme;
 import org.apache.kafka.common.metrics.stats.Histogram.LinearBinScheme;
 
 import org.junit.jupiter.api.Test;
@@ -26,6 +27,7 @@ import java.util.Arrays;
 import java.util.Random;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 public class HistogramTest {
 
@@ -103,6 +105,13 @@ public class HistogramTest {
     }
 
     @Test
+    public void testLinearBinSchemeRejectsNegativeValues() {
+        LinearBinScheme scheme = new LinearBinScheme(10, 10);
+        assertThrows(IllegalArgumentException.class, () -> scheme.toBin(-1.0));
+        assertEquals(9, scheme.toBin(11.0), "A value above max should map to the last bin");
+    }
+
+    @Test
     public void testLinearBinScheme() {
         LinearBinScheme scheme = new LinearBinScheme(10, 10);
         assertEquals(Float.NEGATIVE_INFINITY, scheme.fromBin(-1), 0.001d);
@@ -131,6 +140,82 @@ public class HistogramTest {
         assertEquals(9, scheme.toBin(10.001));
         assertEquals(Float.POSITIVE_INFINITY, scheme.fromBin(10), 0.001d);
         checkBinningConsistency(scheme);
+    }
+
+    @Test
+    public void testExponentialBinScheme() {
+        // min=1, max=1024, 10 bins => ratio = (1024/1)^(1/10) = 2, so bin edges are powers of two.
+        ExponentialBinScheme scheme = new ExponentialBinScheme(10, 1, 1024);
+        assertEquals(Float.NEGATIVE_INFINITY, scheme.fromBin(-1), 0.001d);
+        assertEquals(Float.POSITIVE_INFINITY, scheme.fromBin(10), 0.001d);
+        assertEquals(1.0, scheme.fromBin(0), 0.001d);
+        assertEquals(2.0, scheme.fromBin(1), 0.001d);
+        assertEquals(4.0, scheme.fromBin(2), 0.001d);
+        assertEquals(8.0, scheme.fromBin(3), 0.001d);
+        assertEquals(16.0, scheme.fromBin(4), 0.001d);
+        assertEquals(32.0, scheme.fromBin(5), 0.001d);
+        assertEquals(64.0, scheme.fromBin(6), 0.001d);
+        assertEquals(128.0, scheme.fromBin(7), 0.001d);
+        assertEquals(256.0, scheme.fromBin(8), 0.001d);
+        assertEquals(512.0, scheme.fromBin(9), 0.001d);
+        // Values at or below min land in bin 0; at or above max land in the last bin.
+        assertEquals(0, scheme.toBin(0.5));
+        assertEquals(0, scheme.toBin(1.0));
+        assertEquals(0, scheme.toBin(1.5));
+        assertEquals(1, scheme.toBin(2.0));
+        assertEquals(1, scheme.toBin(3.0));
+        assertEquals(2, scheme.toBin(4.0));
+        assertEquals(5, scheme.toBin(63.0));
+        assertEquals(6, scheme.toBin(64.0));
+        assertEquals(9, scheme.toBin(512.0));
+        assertEquals(9, scheme.toBin(1024.0));
+        assertEquals(9, scheme.toBin(5000.0));
+        checkBinningConsistency(scheme);
+    }
+
+    @Test
+    public void testExponentialBinSchemeValidation() {
+        assertThrows(IllegalArgumentException.class, () -> new ExponentialBinScheme(1, 1, 1024));
+        assertThrows(IllegalArgumentException.class, () -> new ExponentialBinScheme(10, 0, 1024));
+        assertThrows(IllegalArgumentException.class, () -> new ExponentialBinScheme(10, -1, 1024));
+        assertThrows(IllegalArgumentException.class, () -> new ExponentialBinScheme(10, 10, 10));
+        assertThrows(IllegalArgumentException.class, () -> new ExponentialBinScheme(10, 10, 5));
+    }
+
+    @Test
+    public void testExponentialHistogramGivesAccuratePercentilesOverWideRange() {
+        // 1000 log-spaced bins over [1, 1e6] give ~1.4% relative width per bin. Recording the
+        // integers 1..1000 (median ~500, p99 ~990) should reproduce those quantiles within a few
+        // percent — the whole point of exponential bins for wide-range, non-negative quantities.
+        ExponentialBinScheme scheme = new ExponentialBinScheme(1000, 1, 1_000_000);
+        Histogram hist = new Histogram(scheme);
+        for (int i = 1; i <= 1000; i++)
+            hist.record(i);
+        assertEquals(500.0, hist.value(0.5), 500.0 * 0.05);
+        assertEquals(990.0, hist.value(0.99), 990.0 * 0.05);
+        assertEquals(250.0, hist.value(0.25), 250.0 * 0.05);
+    }
+
+    @Test
+    public void testEmptyWindowHasNaNMinMaxAndMergesAway() {
+        BinScheme scheme = new ConstantBinScheme(10, 0, 10);
+        double[] bounds = Histogram.bounds(scheme);
+        Histogram hist = new Histogram(scheme);
+
+        FixedHistogramWindow empty = hist.snapshot(bounds);
+        assertEquals(0L, empty.count());
+        assertEquals(Double.NaN, empty.min());
+        assertEquals(Double.NaN, empty.max());
+
+        hist.record(3.0);
+        hist.record(7.0);
+        FixedHistogramWindow full = hist.snapshot(bounds);
+        for (FixedHistogramWindow merged : new FixedHistogramWindow[] {empty.merge(full), full.merge(empty)}) {
+            assertEquals(2L, merged.count());
+            assertEquals(3.0, merged.min(), 0.0);
+            assertEquals(7.0, merged.max(), 0.0);
+        }
+        assertEquals(Double.NaN, empty.merge(empty).min());
     }
 
     private void checkBinningConsistency(BinScheme scheme) {

@@ -18,7 +18,8 @@
   "type": "request",
   "listeners": ["broker"],
   "name": "PushTelemetryRequest",
-  "validVersions": "0",
+  // Version 1 adds PartIndex and PartCount, so that one push can span several requests.
+  "validVersions": "0-1",
   "flexibleVersions": "0+",
   "fields": [
     {
@@ -40,6 +41,14 @@
     {
       "name": "Metrics", "type": "bytes", "versions": "0+", "zeroCopy": true,
       "about": "Metrics encoded in OpenTelemetry MetricsData v1 protobuf format."
+    },
+    {
+      "name": "PartIndex", "type": "int16", "versions": "1+", "default": "0",
+      "about": "Zero-based index of this request within its push."
+    },
+    {
+      "name": "PartCount", "type": "int16", "versions": "1+", "default": "1",
+      "about": "Total number of requests in this push. At most TelemetryMaxParts."
     }
   ]
 }

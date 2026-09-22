@@ -158,6 +158,9 @@ public class JmxReporter implements MetricsReporter {
     }
 
     private String addAttribute(KafkaMetric metric) {
+        if (!metric.jmxExportable()) {
+            return null;
+        }
         try {
             MetricName metricName = metric.metricName();
             String mBeanName = getMBeanName(prefix, metricName);

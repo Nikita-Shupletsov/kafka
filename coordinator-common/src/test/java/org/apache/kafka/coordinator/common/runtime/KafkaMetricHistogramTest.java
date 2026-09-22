@@ -18,15 +18,20 @@ package org.apache.kafka.coordinator.common.runtime;
 
 import org.apache.kafka.common.MetricName;
 import org.apache.kafka.common.metrics.CompoundStat;
+import org.apache.kafka.common.metrics.KafkaMetric;
 import org.apache.kafka.common.metrics.Metrics;
+import org.apache.kafka.common.metrics.Sensor;
 
 import org.junit.jupiter.api.Test;
 
 import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
+import static org.apache.kafka.coordinator.common.runtime.KafkaMetricHistogram.MAX_LATENCY_MS;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class KafkaMetricHistogramTest {
 
@@ -51,5 +56,49 @@ public class KafkaMetricHistogramTest {
             Set<MetricName> actual = histogram.stats().stream().map(CompoundStat.NamedMeasurable::name).collect(Collectors.toSet());
             assertEquals(expected, actual);
         }
+    }
+
+    @Test
+    public void testMaxIsExactAndPercentilesAreMonotonic() {
+        try (Metrics metrics = new Metrics()) {
+            KafkaMetricHistogram histogram = KafkaMetricHistogram.newLatencyHistogram(
+                suffix -> metrics.metricName("lat-" + suffix, "grp", "desc"));
+            Sensor sensor = metrics.sensor("latency");
+            sensor.add(histogram);
+
+            // Record 1..1000ms.
+            IntStream.rangeClosed(1, 1000).forEach(sensor::record);
+
+            // max is tracked exactly (not binned).
+            assertEquals(1000.0, value(metrics, "lat-max"));
+
+            double p50 = value(metrics, "lat-p50");
+            double p95 = value(metrics, "lat-p95");
+            double p99 = value(metrics, "lat-p99");
+            double p999 = value(metrics, "lat-p999");
+            // Percentiles are ordered and each within two 0.25% bins of the true quantile.
+            assertTrue(p50 < p95 && p95 < p99 && p99 < p999, "percentiles must be monotonic");
+            assertEquals(500.0, p50, 500.0 * 0.005);
+            assertEquals(999.0, p999, 999.0 * 0.005);
+        }
+    }
+
+    @Test
+    public void testRecordingIsCappedToMaxLatency() {
+        try (Metrics metrics = new Metrics()) {
+            KafkaMetricHistogram histogram = KafkaMetricHistogram.newLatencyHistogram(
+                suffix -> metrics.metricName("lat-" + suffix, "grp", "desc"));
+            Sensor sensor = metrics.sensor("latency");
+            sensor.add(histogram);
+
+            // Values above the trackable ceiling are capped rather than rejected or overflowing.
+            IntStream.range(0, 100).forEach(__ -> sensor.record(MAX_LATENCY_MS + 5000L));
+            assertEquals((double) MAX_LATENCY_MS, value(metrics, "lat-max"));
+        }
+    }
+
+    private static double value(Metrics metrics, String name) {
+        KafkaMetric metric = metrics.metrics().get(metrics.metricName(name, "grp", "desc"));
+        return (Double) metric.metricValue();
     }
 }

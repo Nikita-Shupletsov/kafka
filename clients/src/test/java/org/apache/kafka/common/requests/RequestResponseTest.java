@@ -494,6 +494,36 @@ public class RequestResponseTest {
     }
 
     @Test
+    public void testPushTelemetryPartFieldsRoundTripFromV1AndAreRejectedAtV0() {
+        PushTelemetryRequestData data = createPushTelemetryRequest((short) 1).data()
+            .setPartIndex((short) 2)
+            .setPartCount((short) 3);
+        PushTelemetryRequest parsed = PushTelemetryRequest.parse(
+            new PushTelemetryRequest.Builder(data).build((short) 1).serialize(), (short) 1);
+        assertEquals(2, parsed.data().partIndex());
+        assertEquals(3, parsed.data().partCount());
+
+        // A v0 broker cannot be told the push spans several requests.
+        PushTelemetryRequest v0 = new PushTelemetryRequest.Builder(data).build((short) 0);
+        assertThrows(UnsupportedVersionException.class, v0::serialize);
+    }
+
+    @Test
+    public void testTelemetryMaxPartsRoundTripsFromV1AndIsRejectedAtV0() {
+        GetTelemetrySubscriptionsResponse response = new GetTelemetrySubscriptionsResponse(
+            createGetTelemetrySubscriptionsResponse().data().setTelemetryMaxParts((short) 4));
+        GetTelemetrySubscriptionsResponse parsed =
+            GetTelemetrySubscriptionsResponse.parse(response.serialize((short) 1), (short) 1);
+        assertEquals(4, parsed.data().telemetryMaxParts());
+
+        assertThrows(UnsupportedVersionException.class, () -> response.serialize((short) 0));
+        // The default is what a v0 response means: a single part.
+        GetTelemetrySubscriptionsResponse single = createGetTelemetrySubscriptionsResponse();
+        assertEquals(1, GetTelemetrySubscriptionsResponse.parse(single.serialize((short) 0), (short) 0)
+            .data().telemetryMaxParts());
+    }
+
+    @Test
     public void testProduceRequestPartitionSize() {
         Uuid topicId = Uuid.fromString("e9TvBGX5JkYAB0AQorYD4w");
         String topicName = "foo";

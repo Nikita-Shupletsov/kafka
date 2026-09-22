@@ -59,6 +59,7 @@ import org.apache.kafka.common.message.OffsetFetchResponseData;
 import org.apache.kafka.common.message.SyncGroupResponseData;
 import org.apache.kafka.common.metrics.KafkaMetric;
 import org.apache.kafka.common.metrics.Metrics;
+import org.apache.kafka.common.metrics.internals.LatencyPercentilesTest;
 import org.apache.kafka.common.protocol.ApiKeys;
 import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.common.protocol.types.Field;
@@ -242,6 +243,8 @@ public abstract class ConsumerCoordinatorTest {
         assertNotNull(getMetric("commit-latency-max"));
         assertNotNull(getMetric("commit-rate"));
         assertNotNull(getMetric("commit-total"));
+        LatencyPercentilesTest.assertLatencyDistributionRegistered(metrics, "commit-latency",
+            consumerId + groupId + "-coordinator-metrics", Map.of());
         assertNotNull(getMetric("partition-revoked-latency-avg"));
         assertNotNull(getMetric("partition-revoked-latency-max"));
         assertNotNull(getMetric("partition-assigned-latency-avg"));

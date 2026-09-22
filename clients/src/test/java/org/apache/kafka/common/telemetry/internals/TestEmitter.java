@@ -26,6 +26,7 @@ public class TestEmitter implements MetricsEmitter {
     private final List<SinglePointMetric> emittedMetrics;
     private Predicate<? super MetricKeyable> metricsPredicate = metricKeyable -> true;
     private boolean onlyDeltaMetrics;
+    private boolean histograms = true;
 
     public TestEmitter() {
         this(false);
@@ -44,6 +45,15 @@ public class TestEmitter implements MetricsEmitter {
     @Override
     public boolean shouldEmitDeltaMetrics() {
         return onlyDeltaMetrics;
+    }
+
+    @Override
+    public boolean shouldEmitHistograms() {
+        return histograms;
+    }
+
+    public void histograms(boolean histograms) {
+        this.histograms = histograms;
     }
 
     @Override

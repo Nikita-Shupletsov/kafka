@@ -79,6 +79,10 @@ public class MetricsLedger implements AutoCloseable {
         metricNames.remove(metricName);
     }
 
+    public MetricConfig config() {
+        return metrics.config();
+    }
+
     public Sensor sensor(String name) {
         Sensor sensor = metrics.sensor(name);
         sensors.add(sensor);

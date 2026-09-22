@@ -23,6 +23,7 @@ import org.apache.kafka.common.memory.MemoryPool;
 import org.apache.kafka.common.metrics.Metrics;
 import org.apache.kafka.common.metrics.Sensor;
 import org.apache.kafka.common.metrics.internals.IntGaugeSuite;
+import org.apache.kafka.common.metrics.internals.LatencyPercentiles;
 import org.apache.kafka.common.metrics.stats.Avg;
 import org.apache.kafka.common.metrics.stats.CumulativeSum;
 import org.apache.kafka.common.metrics.stats.Max;
@@ -1329,6 +1330,10 @@ public class Selector implements Selectable, AutoCloseable {
                     nodeRequestTime.add(metricName, new Avg());
                     metricName = metrics.metricName("request-latency-max", perConnectionMetricGrpName, tags);
                     nodeRequestTime.add(metricName, new Max());
+                    // Full latency distribution for KIP-714 client telemetry (emitted only if subscribed):
+                    // percentiles + the "-histogram" sibling, all registered on the sensor.
+                    MetricName requestLatency = metrics.metricName("request-latency", perConnectionMetricGrpName, tags);
+                    LatencyPercentiles.addTo(nodeRequestTime, requestLatency, metrics.config());
                 }
             }
         }

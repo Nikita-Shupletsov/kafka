@@ -1872,7 +1872,6 @@ project(':coordinator-common') {
     implementation project(':storage')
     implementation libs.slf4jApi
     implementation libs.metrics
-    implementation libs.hdrHistogram
 
     testFixturesImplementation project(':clients')
     testFixturesImplementation project(':metadata')
@@ -2236,6 +2235,9 @@ project(':clients:clients-integration-tests') {
     implementation project(':group-coordinator:group-coordinator-api')
     implementation project(':transaction-coordinator')
     testImplementation project(':test-common:test-common-util')
+    // To decode the OTLP payloads that clients push to a test exporter.
+    testImplementation libs.opentelemetryProto
+    testImplementation libs.protobuf
 
     testImplementation libs.bcpkix
     testImplementation(libs.apacheda) {

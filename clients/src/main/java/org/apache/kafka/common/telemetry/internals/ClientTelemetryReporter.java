@@ -30,6 +30,7 @@ import org.apache.kafka.common.metrics.KafkaMetric;
 import org.apache.kafka.common.metrics.MetricsContext;
 import org.apache.kafka.common.metrics.MetricsReporter;
 import org.apache.kafka.common.protocol.ApiKeys;
+import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.common.record.internal.CompressionType;
 import org.apache.kafka.common.requests.AbstractRequest;
 import org.apache.kafka.common.requests.AbstractRequest.Builder;
@@ -45,6 +46,8 @@ import org.slf4j.LoggerFactory;
 
 import java.nio.ByteBuffer;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -52,6 +55,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.StringJoiner;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
@@ -118,6 +122,10 @@ public class ClientTelemetryReporter implements MetricsReporter {
     private final ClientTelemetryProvider telemetryProvider;
     private final ClientTelemetrySender clientTelemetrySender;
     private final Time time;
+    // Every registered metric, so each one a subscription selects can be told the push interval it is read at.
+    private final Set<KafkaMetric> metrics = ConcurrentHashMap.newKeySet();
+    // The push interval and selector of the latest subscription; null until one arrives.
+    private volatile Retention retention;
 
     private Map<String, Object> rawOriginalConfig;
     private KafkaMetricsCollector kafkaMetricsCollector;
@@ -169,6 +177,7 @@ public class ClientTelemetryReporter implements MetricsReporter {
 
     @Override
     public void init(List<KafkaMetric> metrics) {
+        metrics.forEach(this::track);
         /*
          metrics collector may not have been initialized (e.g. invalid context labels)
          in which case metrics collection is disabled
@@ -183,6 +192,7 @@ public class ClientTelemetryReporter implements MetricsReporter {
      */
     @Override
     public void metricChange(KafkaMetric metric) {
+        track(metric);
         /*
          metrics collector may not have been initialized (e.g. invalid context labels)
          in which case metrics collection is disabled
@@ -197,6 +207,7 @@ public class ClientTelemetryReporter implements MetricsReporter {
      */
     @Override
     public void metricRemoval(KafkaMetric metric) {
+        metrics.remove(metric);
         /*
          metrics collector may not have been initialized (e.g. invalid context labels)
          in which case metrics collection is disabled
@@ -231,6 +242,46 @@ public class ClientTelemetryReporter implements MetricsReporter {
 
     public ClientTelemetrySender telemetrySender() {
         return clientTelemetrySender;
+    }
+
+    // A metric registered once a subscription is known is told of its push interval straight away, if selected.
+    private void track(KafkaMetric metric) {
+        metrics.add(metric);
+        Retention current = retention;
+        if (current != null) {
+            current.apply(metric);
+        }
+    }
+
+    /*
+     Tells every metric the subscription selects the interval it is pushed at, so that one whose push must see
+     every window (a raw histogram) keeps enough of them; for the rest it is a no-op. Retention only grows, so a
+     metric a later subscription no longer selects keeps what it has.
+    */
+    void retainForPushInterval(int pushIntervalMs, Predicate<? super MetricKeyable> selector) {
+        Retention current = new Retention(pushIntervalMs, selector);
+        retention = current;
+        for (KafkaMetric metric : metrics) {
+            current.apply(metric);
+        }
+    }
+
+    private final class Retention {
+        private final int pushIntervalMs;
+        private final Predicate<? super MetricKeyable> selector;
+
+        private Retention(int pushIntervalMs, Predicate<? super MetricKeyable> selector) {
+            this.pushIntervalMs = pushIntervalMs;
+            this.selector = selector;
+        }
+
+        private void apply(KafkaMetric metric) {
+            // Without a collector nothing is emitted, so nothing needs retaining.
+            KafkaMetricsCollector collector = kafkaMetricsCollector;
+            if (collector != null && collector.selects(metric, selector)) {
+                metric.retainFor(pushIntervalMs);
+            }
+        }
     }
 
     private void initCollectors() {
@@ -274,6 +325,20 @@ public class ClientTelemetryReporter implements MetricsReporter {
         private final Set<CompressionType> unsupportedCompressionTypes = ConcurrentHashMap.newKeySet();
         private final ReadWriteLock lock = new ReentrantReadWriteLock();
         private final Condition subscriptionLoaded = lock.writeLock().newCondition();
+        /*
+         Parts of a multi-part push still to be sent, in order. Populated when a large telemetry snapshot
+         is split into several bounded PushTelemetry requests; they are sent back to back (see handleResponse). After a retriable failure it also holds the failed part and those after it,
+         marked as retries, which are sent at the next interval before a new push is collected. Empty for
+         the common single-part case.
+        */
+        private final ConcurrentLinkedDeque<PushPart> pendingPushParts = new ConcurrentLinkedDeque<>();
+        // The non-terminating push request in flight, kept so that a retriable failure can retry it.
+        private volatile PushPart inFlightPushPart;
+        /*
+         The highest PushTelemetry version of the broker the next request goes to (-1 if not known), as told by
+         telemetryBrokerVersion. It gates histogram metrics and multi-part pushes.
+        */
+        private volatile short brokerPushTelemetryVersion = -1;
         /*
          Initial state should be subscription needed which should allow issuing first telemetry
          request of get telemetry subscription.
@@ -371,6 +436,11 @@ public class ClientTelemetryReporter implements MetricsReporter {
         }
 
         @Override
+        public void telemetryBrokerVersion(short pushTelemetryVersion) {
+            brokerPushTelemetryVersion = pushTelemetryVersion;
+        }
+
+        @Override
         public Optional<AbstractRequest.Builder<?>> createRequest() {
             final ClientTelemetryState localState;
             final ClientTelemetrySubscription localSubscription;
@@ -451,7 +521,10 @@ public class ClientTelemetryReporter implements MetricsReporter {
                 intervalMs,
                 acceptedCompressionTypes,
                 data.deltaTemporality(),
-                selector);
+                selector,
+                data.telemetryMaxBytes(),
+                data.telemetryMaxParts(),
+                data.requestedMetrics());
 
             lock.writeLock().lock();
             try {
@@ -484,6 +557,9 @@ public class ClientTelemetryReporter implements MetricsReporter {
             } finally {
                 lock.writeLock().unlock();
             }
+            if (selector != ClientTelemetryUtils.SELECTOR_NO_METRICS) {
+                retainForPushInterval(intervalMs, selector);
+            }
         }
 
         @Override
@@ -501,14 +577,25 @@ public class ClientTelemetryReporter implements MetricsReporter {
                     return;
                 }
 
-                Optional<Integer> errorIntervalMsOpt = ClientTelemetryUtils.maybeFetchErrorIntervalMs(data.errorCode(),
-                    subscription.pushIntervalMs());
+                PushPart sent = inFlightPushPart;
+                inFlightPushPart = null;
+                Errors error = Errors.forCode(data.errorCode());
+                /*
+                 A retried part that the broker rejects as invalid was delivered after all: it is a duplicate
+                 of a part whose response was lost.
+                */
+                boolean delivered = error == Errors.INVALID_REQUEST && sent != null && sent.retry;
+                Optional<Integer> errorIntervalMsOpt = delivered ? Optional.empty()
+                    : ClientTelemetryUtils.maybeFetchErrorIntervalMs(data.errorCode(), subscription.pushIntervalMs());
                 /*
                  If the error code indicates that the interval ms needs to be updated as per the error
                  code then update the interval ms and state so that the subscription can be re-fetched,
                  and the push retried.
                 */
                 if (errorIntervalMsOpt.isPresent()) {
+                    // Abandon any remaining parts of the current multi-part push. A throttled part is not retried
+                    // either: retrying would work against the broker asking the client to back off.
+                    pendingPushParts.clear();
                     if (!maybeSetState(ClientTelemetryState.SUBSCRIPTION_NEEDED)) {
                         log.warn("Unable to transition state after failed push telemetry from state {}", state);
                     }
@@ -517,7 +604,11 @@ public class ClientTelemetryReporter implements MetricsReporter {
                 }
 
                 lastRequestMs = nowMs;
-                intervalMs = subscription.pushIntervalMs();
+                /*
+                 If more parts of a multi-part push remain for this window, send the next one
+                 immediately (interval 0) rather than waiting a full push interval.
+                */
+                intervalMs = pendingPushParts.isEmpty() ? subscription.pushIntervalMs() : 0;
                 if (!maybeSetState(ClientTelemetryState.PUSH_NEEDED)) {
                     log.warn("Unable to transition state after successful push telemetry from state {}", state);
                 }
@@ -710,11 +801,24 @@ public class ClientTelemetryReporter implements MetricsReporter {
         }
 
         private Optional<Builder<?>> createPushRequest(ClientTelemetrySubscription localSubscription, boolean terminating) {
-            MetricsData payload;
-            try (MetricsEmitter emitter = new ClientTelemetryEmitter(localSubscription.selector(), localSubscription.deltaTemporality())) {
+            // A broker at PushTelemetry version 0 cannot take part fields. Re-fetching the subscription on a
+            // broker change already rules this out; this keeps a miss from failing the push.
+            boolean singlePartBroker = brokerPushTelemetryVersion == 0;
+            inFlightPushPart = nextPendingPart(terminating || singlePartBroker);
+            if (inFlightPushPart != null) {
+                return Optional.of(inFlightPushPart.request);
+            }
+
+            /*
+             Histograms go only to a broker at PushTelemetry version 1 or later, so that a receiver plugin on an
+             older broker never sees a metric type it was not written for.
+            */
+            List<SinglePointMetric> metrics;
+            try (MetricsEmitter emitter = new ClientTelemetryEmitter(localSubscription.selector(),
+                    localSubscription.deltaTemporality(), brokerPushTelemetryVersion >= 1)) {
                 emitter.init();
                 kafkaMetricsCollector.collect(emitter);
-                payload = createPayload(emitter.emittedMetrics());
+                metrics = emitter.emittedMetrics();
             } catch (Exception e) {
                 log.warn("Error constructing client telemetry payload: ", e);
                 // Update last accessed time for push request to be retried on next interval.
@@ -722,12 +826,153 @@ public class ClientTelemetryReporter implements MetricsReporter {
                 return Optional.empty();
             }
 
+            /*
+             Pack the snapshot, in RequestedMetrics priority order, into at most maxParts payloads, each within
+             the broker's TelemetryMaxBytes, dropping the lowest-priority metrics that do not fit. Every push is
+             bounded this way, whatever the broker's version: a terminating push, and one to a broker that cannot
+             take part fields, get a single part. The size is measured uncompressed, so a part also fits the
+             broker's bound on the decompressed payload. If nothing fits, the push still goes out, empty.
+            */
+            int maxParts = terminating || singlePartBroker ? 1 : localSubscription.maxParts();
+            List<MetricsData> payloads = partition(metrics, localSubscription.maxBytes(), maxParts,
+                localSubscription.requestedMetrics());
+            if (payloads.isEmpty()) {
+                payloads = List.of(createPayload(List.of()));
+            }
+
+            // The part count is known before anything is sent, so every part is stamped with it.
+            List<PushPart> parts = new ArrayList<>(payloads.size());
+            for (int i = 0; i < payloads.size(); i++) {
+                parts.add(new PushPart(buildPushRequest(localSubscription, payloads.get(i), terminating, i, payloads.size()),
+                    localSubscription.subscriptionId(), i));
+            }
+
+            // Emit the first part now and buffer the rest to be sent back to back.
+            for (int i = 1; i < parts.size(); i++) {
+                pendingPushParts.offerLast(parts.get(i));
+            }
+            if (!terminating) {
+                inFlightPushPart = parts.get(0);
+            }
+            return Optional.of(parts.get(0).request);
+        }
+
+        /*
+         The continuation of a multi-part push, including a part being retried: the next buffered part,
+         or null if there is none or the buffer cannot be sent (discard) and is dropped. A terminating push is
+         always a single, self-contained request, so it never consumes the buffer.
+        */
+        private PushPart nextPendingPart(boolean discard) {
+            if (discard) {
+                pendingPushParts.clear();
+                return null;
+            }
+            return pendingPushParts.pollFirst();
+        }
+
+        /*
+         Keep a part that failed with a retriable network error, to be sent again right away, ahead of the parts
+         after it. Only a multi-part subscription retries, so a single-part push behaves as it always has. The
+         first part is not retried either: a broker that did receive it would take a second index 0 for a new
+         push and throttle it, so a push whose first part fails is dropped, as a single-part push is. A part is
+         retried once: if it fails again, it is not kept and the rest of the push is dropped. Returns whether the
+         part was kept.
+        */
+        private boolean keepForRetry(PushPart failed) {
+            if (failed == null || failed.retry || failed.partIndex == 0
+                    || subscription == null || subscription.maxParts() <= 1) {
+                return false;
+            }
+            failed.retry = true;
+            pendingPushParts.addFirst(failed);
+            return true;
+        }
+
+        /**
+         * Orders the metrics by priority and packs them into at most {@code maxParts}
+         * {@link MetricsData} payloads, each with a serialized (decompressed) size no larger than
+         * {@code maxBytes}. Metrics left over when no parts remain, or that do not fit even into an
+         * empty payload, are dropped with a warning.
+         */
+        private List<MetricsData> partition(List<SinglePointMetric> metrics, int maxBytes, int maxParts,
+            List<String> requestedMetrics) {
+            List<MetricsData> result = new ArrayList<>();
+            for (List<SinglePointMetric> group : partitionGroups(metrics, maxBytes, maxParts, requestedMetrics)) {
+                result.add(createPayload(group));
+            }
+            return result;
+        }
+
+        /**
+         * The priority-ordered, size-bounded grouping behind {@link #partition}: returns the metrics
+         * assigned to each part (each part's serialized size ≤ {@code maxBytes}, at most
+         * {@code maxParts} parts). Parts are filled one at a time: each pass goes through the remaining
+         * metrics in priority order, adds every one that still fits and skips the others, which the next
+         * part starts from. Exposed for testing so assertions can inspect the grouping without decoding
+         * OTLP payloads.
+         */
+        // Visible for testing
+        List<List<SinglePointMetric>> partitionGroups(List<SinglePointMetric> metrics, int maxBytes,
+            int maxParts, List<String> requestedMetrics) {
+            List<SinglePointMetric> remaining = new ArrayList<>(metrics);
+            remaining.sort(ClientTelemetryUtils.priorityComparator(requestedMetrics));
+            Map<SinglePointMetric, Integer> contributions = new IdentityHashMap<>();
+            for (SinglePointMetric metric : remaining) {
+                contributions.put(metric, serializedContribution(metric));
+            }
+
+            List<List<SinglePointMetric>> parts = new ArrayList<>();
+            while (!remaining.isEmpty() && parts.size() < maxParts) {
+                List<SinglePointMetric> part = new ArrayList<>();
+                List<SinglePointMetric> skipped = new ArrayList<>();
+                int partSize = 0;
+                for (SinglePointMetric metric : remaining) {
+                    int contribution = contributions.get(metric);
+                    if (partSize + contribution <= maxBytes) {
+                        part.add(metric);
+                        partSize += contribution;
+                    } else {
+                        skipped.add(metric);
+                    }
+                }
+                if (part.isEmpty()) {
+                    // Nothing fits even into an empty part, so no further part would take any of them.
+                    break;
+                }
+                parts.add(part);
+                remaining = skipped;
+            }
+
+            if (!remaining.isEmpty()) {
+                log.warn("Dropping {} telemetry metric(s) that do not fit in {} part(s) of {} bytes",
+                    remaining.size(), maxParts, maxBytes);
+                if (log.isDebugEnabled()) {
+                    for (SinglePointMetric metric : remaining) {
+                        log.debug("Dropped telemetry metric {}", metric.key().name());
+                    }
+                }
+            }
+            return parts;
+        }
+
+        /**
+         * The exact number of bytes this metric contributes to a {@link MetricsData}'s serialized
+         * (decompressed) size — i.e. one {@code resource_metrics} entry including its tag and length.
+         */
+        // Visible for testing
+        int serializedContribution(SinglePointMetric metric) {
+            ResourceMetrics rm = buildMetric(metric.builder().build());
+            return MetricsData.newBuilder().addResourceMetrics(rm).build().getSerializedSize();
+        }
+
+        private AbstractRequest.Builder<?> buildPushRequest(ClientTelemetrySubscription localSubscription,
+            MetricsData payload, boolean terminating, int partIndex, int partCount) {
             CompressionType compressionType = ClientTelemetryUtils.preferredCompressionType(localSubscription.acceptedCompressionTypes(), unsupportedCompressionTypes);
             ByteBuffer compressedPayload;
             try {
                 compressedPayload = ClientTelemetryUtils.compress(payload, compressionType);
             } catch (Throwable e) {
-                // Distinguish between recoverable errors (NoClassDefFoundError for missing compression libs) 
+                // Distinguish between recoverable errors (NoClassDefFoundError for missing compression libs)
                 // and fatal errors (OutOfMemoryError, etc.) that should terminate telemetry.
                 if (e instanceof Error && !(e instanceof NoClassDefFoundError) && !(e.getCause() instanceof NoClassDefFoundError)) {
                     lock.writeLock().lock();
@@ -746,15 +991,15 @@ public class ClientTelemetryReporter implements MetricsReporter {
                 compressionType = CompressionType.NONE;
             }
 
-            AbstractRequest.Builder<?> requestBuilder = new PushTelemetryRequest.Builder(
+            return new PushTelemetryRequest.Builder(
                 new PushTelemetryRequestData()
                     .setClientInstanceId(localSubscription.clientInstanceId())
                     .setSubscriptionId(localSubscription.subscriptionId())
                     .setTerminating(terminating)
                     .setCompressionType(compressionType.id)
-                    .setMetrics(compressedPayload), true);
-
-            return Optional.of(requestBuilder);
+                    .setMetrics(compressedPayload)
+                    .setPartIndex((short) partIndex)
+                    .setPartCount((short) partCount), true);
         }
 
         /**
@@ -771,6 +1016,10 @@ public class ClientTelemetryReporter implements MetricsReporter {
         void updateSubscriptionResult(ClientTelemetrySubscription subscription, long timeMs) {
             lock.writeLock().lock();
             try {
+                // Parts kept for retry carry the subscription id they were built for; a new one would reject them.
+                if (pendingPushParts.stream().anyMatch(part -> part.subscriptionId != subscription.subscriptionId())) {
+                    pendingPushParts.clear();
+                }
                 this.subscription = Objects.requireNonNull(subscription);
                 /*
                  If the subscription is updated for the client, we want to attempt to spread out the push
@@ -854,7 +1103,22 @@ public class ClientTelemetryReporter implements MetricsReporter {
             final long nowMs = time.milliseconds();
             lock.writeLock().lock();
             try {
+                // A retriable network failure keeps the in-flight part for retry; anything else abandons the push.
+                boolean kept = isRetryable(maybeFatalException) && keepForRetry(inFlightPushPart);
+                if (!kept) {
+                    pendingPushParts.clear();
+                }
+                inFlightPushPart = null;
                 if (isTerminatingState()) {
+                    return;
+                }
+                // Retry the kept part right away, within the current push, rather than waiting for the next one.
+                if (kept && state == ClientTelemetryState.PUSH_IN_PROGRESS) {
+                    intervalMs = 0;
+                    lastRequestMs = nowMs;
+                    if (!maybeSetState(ClientTelemetryState.PUSH_NEEDED)) {
+                        log.warn("Unable to transition state after failed push telemetry from state {}", state);
+                    }
                     return;
                 }
                 if (state != ClientTelemetryState.SUBSCRIPTION_IN_PROGRESS && state != ClientTelemetryState.PUSH_IN_PROGRESS) {
@@ -960,6 +1224,20 @@ public class ClientTelemetryReporter implements MetricsReporter {
      * Representation of the telemetry subscription that is retrieved from the cluster at startup and
      * then periodically afterward, following the telemetry push.
      */
+    // One request of a push, and whether it is being retried after a retriable failure.
+    private static final class PushPart {
+        private final AbstractRequest.Builder<?> request;
+        private final int subscriptionId;
+        private final int partIndex;
+        private volatile boolean retry;
+
+        private PushPart(AbstractRequest.Builder<?> request, int subscriptionId, int partIndex) {
+            this.request = request;
+            this.subscriptionId = subscriptionId;
+            this.partIndex = partIndex;
+        }
+    }
+
     static class ClientTelemetrySubscription {
 
         private final Uuid clientInstanceId;
@@ -968,16 +1246,34 @@ public class ClientTelemetryReporter implements MetricsReporter {
         private final List<CompressionType> acceptedCompressionTypes;
         private final boolean deltaTemporality;
         private final Predicate<? super MetricKeyable> selector;
+        private final int maxBytes;
+        private final int maxParts;
+        private final List<String> requestedMetrics;
 
+        // Convenience constructor for a single-part subscription with no size cap (used by tests
+        // and any caller that does not exercise multi-part splitting).
         ClientTelemetrySubscription(Uuid clientInstanceId, int subscriptionId, int pushIntervalMs,
                 List<CompressionType> acceptedCompressionTypes, boolean deltaTemporality,
                 Predicate<? super MetricKeyable> selector) {
+            this(clientInstanceId, subscriptionId, pushIntervalMs, acceptedCompressionTypes,
+                deltaTemporality, selector, Integer.MAX_VALUE, 1, List.of());
+        }
+
+        ClientTelemetrySubscription(Uuid clientInstanceId, int subscriptionId, int pushIntervalMs,
+                List<CompressionType> acceptedCompressionTypes, boolean deltaTemporality,
+                Predicate<? super MetricKeyable> selector, int maxBytes, int maxParts,
+                List<String> requestedMetrics) {
             this.clientInstanceId = clientInstanceId;
             this.subscriptionId = subscriptionId;
             this.pushIntervalMs = pushIntervalMs;
             this.acceptedCompressionTypes = List.copyOf(acceptedCompressionTypes);
             this.deltaTemporality = deltaTemporality;
             this.selector = selector;
+            this.maxBytes = maxBytes;
+            // A broker that does not advertise a cap (old broker / absent field) reports 1, i.e.
+            // single-part. Guard against a non-positive value defensively.
+            this.maxParts = Math.max(1, maxParts);
+            this.requestedMetrics = requestedMetrics == null ? List.of() : List.copyOf(requestedMetrics);
         }
 
         public Uuid clientInstanceId() {
@@ -1004,6 +1300,18 @@ public class ClientTelemetryReporter implements MetricsReporter {
             return selector;
         }
 
+        public int maxBytes() {
+            return maxBytes;
+        }
+
+        public int maxParts() {
+            return maxParts;
+        }
+
+        public List<String> requestedMetrics() {
+            return requestedMetrics;
+        }
+
         @Override
         public String toString() {
             return new StringJoiner(", ", "ClientTelemetrySubscription{", "}")
@@ -1013,6 +1321,9 @@ public class ClientTelemetryReporter implements MetricsReporter {
                 .add("acceptedCompressionTypes=" + acceptedCompressionTypes)
                 .add("deltaTemporality=" + deltaTemporality)
                 .add("selector=" + selector)
+                .add("maxBytes=" + maxBytes)
+                .add("maxParts=" + maxParts)
+                .add("requestedMetrics=" + requestedMetrics)
                 .toString();
         }
     }

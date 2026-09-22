@@ -1674,6 +1674,9 @@ public class NetworkClient implements KafkaClient {
             String nodeConnectionId = node.idString();
 
             if (canSendRequest(nodeConnectionId, now)) {
+                NodeApiVersions nodeVersions = apiVersions.get(nodeConnectionId);
+                ApiVersion pushVersion = nodeVersions == null ? null : nodeVersions.apiVersion(ApiKeys.PUSH_TELEMETRY);
+                clientTelemetrySender.telemetryBrokerVersion(pushVersion == null ? -1 : pushVersion.maxVersion());
                 Optional<AbstractRequest.Builder<?>> requestOpt = clientTelemetrySender.createRequest();
 
                 if (requestOpt.isEmpty())

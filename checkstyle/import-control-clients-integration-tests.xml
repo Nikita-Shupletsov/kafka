@@ -30,6 +30,10 @@
 
     <allow pkg="com.yammer.metrics.core" />
 
+    <!-- to decode pushed client telemetry -->
+    <allow pkg="io.opentelemetry.proto" />
+    <allow pkg="com.google.protobuf" />
+
     <subpackage name="clients.producer">
         <allow pkg="org.opentest4j"/>
     </subpackage>

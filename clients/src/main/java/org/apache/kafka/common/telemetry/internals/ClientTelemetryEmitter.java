@@ -26,11 +26,17 @@ public class ClientTelemetryEmitter implements MetricsEmitter {
     private final Predicate<? super MetricKeyable> selector;
     private final List<SinglePointMetric> emitted;
     private final boolean deltaMetrics;
+    private final boolean histograms;
 
     ClientTelemetryEmitter(Predicate<? super MetricKeyable> selector, boolean deltaMetrics) {
+        this(selector, deltaMetrics, true);
+    }
+
+    ClientTelemetryEmitter(Predicate<? super MetricKeyable> selector, boolean deltaMetrics, boolean histograms) {
         this.selector = selector;
         this.emitted = new ArrayList<>();
         this.deltaMetrics = deltaMetrics;
+        this.histograms = histograms;
     }
 
     @Override
@@ -41,6 +47,11 @@ public class ClientTelemetryEmitter implements MetricsEmitter {
     @Override
     public boolean shouldEmitDeltaMetrics() {
         return deltaMetrics;
+    }
+
+    @Override
+    public boolean shouldEmitHistograms() {
+        return histograms;
     }
 
     @Override

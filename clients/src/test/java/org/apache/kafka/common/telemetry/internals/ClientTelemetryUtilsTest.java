@@ -194,4 +194,36 @@ public class ClientTelemetryUtilsTest {
         assertNotNull(result);
         assertArrayEquals(raw, Utils.toArray(result));
     }
+
+    @Test
+    public void testPriorityComparatorOrdersByRequestedMetricsThenName() {
+        Instant now = Instant.ofEpochMilli(0);
+        SinglePointMetric ax = SinglePointMetric.gauge(new MetricKey("a.x"), 1.0, now, Set.of());
+        SinglePointMetric ay = SinglePointMetric.gauge(new MetricKey("a.y"), 1.0, now, Set.of());
+        SinglePointMetric by = SinglePointMetric.gauge(new MetricKey("b.y"), 1.0, now, Set.of());
+        SinglePointMetric cz = SinglePointMetric.gauge(new MetricKey("c.z"), 1.0, now, Set.of());
+
+        List<SinglePointMetric> metrics = new ArrayList<>(List.of(cz, by, ay, ax));
+        metrics.sort(ClientTelemetryUtils.priorityComparator(List.of("a.", "b.")));
+
+        // a.* (rank 0) before b.* (rank 1) before unmatched c.* (rank MAX); within a.*, by name.
+        assertEquals(List.of("a.x", "a.y", "b.y", "c.z"), metricNames(metrics));
+    }
+
+    @Test
+    public void testPriorityComparatorFallsBackToNameForAllMetricsSubscription() {
+        Instant now = Instant.ofEpochMilli(0);
+        SinglePointMetric ax = SinglePointMetric.gauge(new MetricKey("a.x"), 1.0, now, Set.of());
+        SinglePointMetric bz = SinglePointMetric.gauge(new MetricKey("b.z"), 1.0, now, Set.of());
+
+        List<SinglePointMetric> metrics = new ArrayList<>(List.of(bz, ax));
+        // "*" conveys no family order, so ordering falls back to metric name.
+        metrics.sort(ClientTelemetryUtils.priorityComparator(List.of("*")));
+
+        assertEquals(List.of("a.x", "b.z"), metricNames(metrics));
+    }
+
+    private static List<String> metricNames(List<SinglePointMetric> metrics) {
+        return metrics.stream().map(metric -> metric.key().name()).collect(java.util.stream.Collectors.toList());
+    }
 }

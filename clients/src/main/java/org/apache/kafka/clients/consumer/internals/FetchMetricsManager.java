@@ -81,6 +81,7 @@ public class FetchMetricsManager extends AbstractConsumerMetricsManager {
                 .withAvg(metricsRegistry.fetchLatencyAvg)
                 .withMax(metricsRegistry.fetchLatencyMax)
                 .withMeter(new WindowedCount(), metricsRegistry.fetchRequestRate, metricsRegistry.fetchRequestTotal)
+                .withPercentiles(metricsRegistry.fetchLatencyDistribution)
                 .build();
         this.recordsLag = new SensorBuilder(metrics, "records-lag")
                 .withMax(metricsRegistry.recordsLagMax)

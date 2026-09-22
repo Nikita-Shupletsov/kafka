@@ -17,7 +17,7 @@
   "apiKey": 71,
   "type": "response",
   "name": "GetTelemetrySubscriptionsResponse",
-  "validVersions": "0",
+  "validVersions": "0-1",
   "flexibleVersions": "0+",
   "fields": [
     {
@@ -54,7 +54,11 @@
     },
     {
       "name": "RequestedMetrics", "type": "[]string", "versions": "0+",
-      "about": "Requested metrics prefix string match. Empty array: No metrics subscribed, Array[0] empty string: All metrics subscribed."
+      "about": "Requested metrics prefix string match, in priority order, highest first: when a push must be trimmed, metrics matching later prefixes are dropped first. Empty array: No metrics subscribed, Array[0] empty string: All metrics subscribed."
+    },
+    {
+      "name": "TelemetryMaxParts", "type": "int16", "versions": "1+", "default": "1",
+      "about": "The maximum number of PushTelemetryRequest parts one push from this client may span. 1 means single-part (no splitting)."
     }
   ]
 }

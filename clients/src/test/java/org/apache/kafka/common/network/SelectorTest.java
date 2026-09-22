@@ -21,6 +21,7 @@ import org.apache.kafka.common.memory.MemoryPool;
 import org.apache.kafka.common.memory.SimpleMemoryPool;
 import org.apache.kafka.common.metrics.KafkaMetric;
 import org.apache.kafka.common.metrics.Metrics;
+import org.apache.kafka.common.metrics.internals.LatencyPercentilesTest;
 import org.apache.kafka.common.security.auth.SecurityProtocol;
 import org.apache.kafka.common.utils.MockTime;
 import org.apache.kafka.common.utils.Time;
@@ -148,6 +149,14 @@ public class SelectorTest {
         // reconnect and do another request
         blockingConnect(node);
         assertEquals("hello", blockingRequest(node, "hello"));
+    }
+
+    @Test
+    public void testNodeRequestLatencyDistributionIsRegistered() throws Exception {
+        blockingConnect("0");
+        assertEquals("hello", blockingRequest("0", "hello"));
+        LatencyPercentilesTest.assertLatencyDistributionRegistered(metrics, "request-latency",
+            METRIC_GROUP + "-node-metrics", Map.of("node-id", "node-0"));
     }
 
     /**

@@ -16,15 +16,22 @@
  */
 package org.apache.kafka.common.telemetry.internals;
 
+import org.apache.kafka.common.metrics.stats.AdaptiveHistogramWindow;
+import org.apache.kafka.common.metrics.stats.FixedHistogramWindow;
+
 import java.time.Instant;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.OptionalDouble;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 import io.opentelemetry.proto.common.v1.AnyValue;
 import io.opentelemetry.proto.common.v1.KeyValue;
 import io.opentelemetry.proto.metrics.v1.AggregationTemporality;
+import io.opentelemetry.proto.metrics.v1.ExponentialHistogramDataPoint;
+import io.opentelemetry.proto.metrics.v1.HistogramDataPoint;
 import io.opentelemetry.proto.metrics.v1.Metric;
 import io.opentelemetry.proto.metrics.v1.NumberDataPoint;
 
@@ -59,6 +66,115 @@ public class SinglePointMetric implements MetricKeyable {
     // Visible for testing
     boolean hasGauge() {
         return metricBuilder.hasGauge();
+    }
+
+    // Visible for testing
+    boolean hasExponentialHistogram() {
+        return metricBuilder.hasExponentialHistogram();
+    }
+
+    // Visible for testing
+    boolean isExponentialHistogramDeltaTemporality() {
+        return metricBuilder.getExponentialHistogram().getAggregationTemporality()
+            == AggregationTemporality.AGGREGATION_TEMPORALITY_DELTA;
+    }
+
+    // Visible for testing
+    long exponentialHistogramCount() {
+        return exponentialHistogramDataPoint().getCount();
+    }
+
+    // Visible for testing
+    double exponentialHistogramSum() {
+        return exponentialHistogramDataPoint().getSum();
+    }
+
+    // Visible for testing
+    OptionalDouble exponentialHistogramMin() {
+        ExponentialHistogramDataPoint point = exponentialHistogramDataPoint();
+        return point.hasMin() ? OptionalDouble.of(point.getMin()) : OptionalDouble.empty();
+    }
+
+    // Visible for testing
+    OptionalDouble exponentialHistogramMax() {
+        ExponentialHistogramDataPoint point = exponentialHistogramDataPoint();
+        return point.hasMax() ? OptionalDouble.of(point.getMax()) : OptionalDouble.empty();
+    }
+
+    // Visible for testing
+    int exponentialHistogramScale() {
+        return exponentialHistogramDataPoint().getScale();
+    }
+
+    // Visible for testing
+    long exponentialHistogramZeroCount() {
+        return exponentialHistogramDataPoint().getZeroCount();
+    }
+
+    // Visible for testing
+    int exponentialHistogramPositiveOffset() {
+        return exponentialHistogramDataPoint().getPositive().getOffset();
+    }
+
+    // Visible for testing
+    List<Long> exponentialHistogramPositiveBucketCounts() {
+        return exponentialHistogramDataPoint().getPositive().getBucketCountsList();
+    }
+
+    // Visible for testing
+    List<Long> exponentialHistogramNegativeBucketCounts() {
+        return exponentialHistogramDataPoint().getNegative().getBucketCountsList();
+    }
+
+    private ExponentialHistogramDataPoint exponentialHistogramDataPoint() {
+        return metricBuilder.getExponentialHistogram().getDataPoints(0);
+    }
+
+    // Visible for testing
+    boolean hasExplicitHistogram() {
+        return metricBuilder.hasHistogram();
+    }
+
+    // Visible for testing
+    boolean isExplicitHistogramDeltaTemporality() {
+        return metricBuilder.getHistogram().getAggregationTemporality()
+            == AggregationTemporality.AGGREGATION_TEMPORALITY_DELTA;
+    }
+
+    // Visible for testing
+    long explicitHistogramCount() {
+        return explicitHistogramDataPoint().getCount();
+    }
+
+    // Visible for testing
+    double explicitHistogramSum() {
+        return explicitHistogramDataPoint().getSum();
+    }
+
+    // Visible for testing
+    OptionalDouble explicitHistogramMin() {
+        HistogramDataPoint point = explicitHistogramDataPoint();
+        return point.hasMin() ? OptionalDouble.of(point.getMin()) : OptionalDouble.empty();
+    }
+
+    // Visible for testing
+    OptionalDouble explicitHistogramMax() {
+        HistogramDataPoint point = explicitHistogramDataPoint();
+        return point.hasMax() ? OptionalDouble.of(point.getMax()) : OptionalDouble.empty();
+    }
+
+    // Visible for testing
+    List<Double> explicitHistogramBounds() {
+        return explicitHistogramDataPoint().getExplicitBoundsList();
+    }
+
+    // Visible for testing
+    List<Long> explicitHistogramBucketCounts() {
+        return explicitHistogramDataPoint().getBucketCountsList();
+    }
+
+    private HistogramDataPoint explicitHistogramDataPoint() {
+        return metricBuilder.getHistogram().getDataPoints(0);
     }
 
     // Visible for testing
@@ -153,6 +269,71 @@ public class SinglePointMetric implements MetricKeyable {
             .setStartTimeUnixNano(toTimeUnixNanos(startTimestamp));
 
         return sum(metricKey, AggregationTemporality.AGGREGATION_TEMPORALITY_DELTA, monotonic, point, excludeLabels);
+    }
+
+    /*
+        Method to construct the OTLP exponential-histogram metric type. A snapshot covers one or more closed
+        windows that no earlier point covered, so it is always delta temporality.
+     */
+    public static SinglePointMetric deltaExponentialHistogram(MetricKey metricKey, AdaptiveHistogramWindow snapshot,
+        Instant timestamp, Instant startTimestamp, Set<String> excludeLabels) {
+        ExponentialHistogramDataPoint.Builder point = ExponentialHistogramDataPoint.newBuilder()
+            .setTimeUnixNano(toTimeUnixNanos(timestamp))
+            .setStartTimeUnixNano(toTimeUnixNanos(startTimestamp))
+            .setScale(snapshot.scale())
+            .setCount(snapshot.count())
+            .setSum(snapshot.sum())
+            .setPositive(buckets(snapshot.offset(), snapshot.binCounts()));
+        // min/max are only meaningful for a non-empty window.
+        if (snapshot.count() > 0) {
+            point.setMin(snapshot.min()).setMax(snapshot.max());
+        }
+        point.addAllAttributes(asAttributes(metricKey.tags(), excludeLabels));
+
+        Metric.Builder metric = Metric.newBuilder().setName(metricKey.name());
+        metric.getExponentialHistogramBuilder()
+            .setAggregationTemporality(AggregationTemporality.AGGREGATION_TEMPORALITY_DELTA)
+            .addDataPoints(point);
+        return new SinglePointMetric(metricKey, metric);
+    }
+
+    /*
+        Method to construct the OTLP explicit-bucket histogram metric type, for a fixed-bin store's windows.
+        Delta temporality for the same reason as deltaExponentialHistogram.
+     */
+    public static SinglePointMetric deltaExplicitHistogram(MetricKey metricKey, FixedHistogramWindow snapshot,
+        Instant timestamp, Instant startTimestamp, Set<String> excludeLabels) {
+        HistogramDataPoint.Builder point = HistogramDataPoint.newBuilder()
+            .setTimeUnixNano(toTimeUnixNanos(timestamp))
+            .setStartTimeUnixNano(toTimeUnixNanos(startTimestamp))
+            .setCount(snapshot.count())
+            .setSum(snapshot.sum());
+        for (double bound : snapshot.bounds()) {
+            point.addExplicitBounds(bound);
+        }
+        for (long count : snapshot.binCounts()) {
+            point.addBucketCounts(count);
+        }
+        // min/max are only meaningful for a non-empty window.
+        if (snapshot.count() > 0) {
+            point.setMin(snapshot.min()).setMax(snapshot.max());
+        }
+        point.addAllAttributes(asAttributes(metricKey.tags(), excludeLabels));
+
+        Metric.Builder metric = Metric.newBuilder().setName(metricKey.name());
+        metric.getHistogramBuilder()
+            .setAggregationTemporality(AggregationTemporality.AGGREGATION_TEMPORALITY_DELTA)
+            .addDataPoints(point);
+        return new SinglePointMetric(metricKey, metric);
+    }
+
+    private static ExponentialHistogramDataPoint.Buckets buckets(int offset, long[] counts) {
+        ExponentialHistogramDataPoint.Buckets.Builder buckets = ExponentialHistogramDataPoint.Buckets.newBuilder()
+            .setOffset(offset);
+        for (long count : counts) {
+            buckets.addBucketCounts(count);
+        }
+        return buckets.build();
     }
 
     /*

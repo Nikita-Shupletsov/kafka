@@ -29,6 +29,7 @@ import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.MetricName;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.config.ConfigResource;
 import org.apache.kafka.common.metrics.KafkaMetric;
 import org.apache.kafka.common.metrics.MetricsReporter;
 import org.apache.kafka.common.serialization.StringDeserializer;
@@ -39,6 +40,9 @@ import org.apache.kafka.common.test.api.ClusterTest;
 import org.apache.kafka.common.test.api.Type;
 import org.apache.kafka.server.telemetry.ClientTelemetryExporter;
 import org.apache.kafka.server.telemetry.ClientTelemetryExporterProvider;
+import org.apache.kafka.test.TestUtils;
+
+import com.google.protobuf.InvalidProtocolBufferException;
 
 import java.time.Duration;
 import java.util.ArrayList;
@@ -49,8 +53,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.stream.Collectors;
+
+import io.opentelemetry.proto.metrics.v1.Metric;
+import io.opentelemetry.proto.metrics.v1.MetricsData;
 
 import static org.apache.kafka.clients.admin.AdminClientConfig.METRIC_REPORTER_CLASSES_CONFIG;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -131,6 +139,60 @@ public class ClientTelemetryTest {
                     String.format("actual metrics name: %s dont contains expected: %s", actualMetricsName,
                             expectedName)));
             assertTrue(actualMetricsName.containsAll(expectedMetricsName));
+        }
+    }
+
+    @ClusterTest(
+            types = Type.KRAFT,
+            serverProperties = {
+                @ClusterConfigProperty(key = METRIC_REPORTER_CLASSES_CONFIG, value = "org.apache.kafka.clients.admin.ClientTelemetryTest$HistogramCapturingExporter"),
+            })
+    public void testHistogramIsPushedEndToEnd(ClusterInstance clusterInstance) throws Exception {
+        HistogramCapturingExporter.HISTOGRAMS.clear();
+        try (Admin admin = Admin.create(Map.of(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, clusterInstance.bootstrapServers()))) {
+            ConfigResource subscription = new ConfigResource(ConfigResource.Type.CLIENT_METRICS, "producer-histograms");
+            admin.incrementalAlterConfigs(Map.of(subscription, List.of(
+                new AlterConfigOp(new ConfigEntry("metrics", "org.apache.kafka.producer."), AlterConfigOp.OpType.SET),
+                new AlterConfigOp(new ConfigEntry("interval.ms", "500"), AlterConfigOp.OpType.SET)
+            ))).all().get();
+            admin.createTopics(List.of(new NewTopic("histogram-topic", 1, (short) 1))).all().get();
+        }
+
+        Map<String, Object> producerConfigs = new HashMap<>();
+        producerConfigs.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, clusterInstance.bootstrapServers());
+        producerConfigs.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
+        producerConfigs.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
+        // Short sample windows, so the histogram windows close well within the test.
+        producerConfigs.put(ProducerConfig.METRICS_SAMPLE_WINDOW_MS_CONFIG, 200);
+        try (Producer<String, String> producer = new KafkaProducer<>(producerConfigs)) {
+            TestUtils.waitForCondition(() -> {
+                producer.send(new ProducerRecord<>("histogram-topic", "value")).get();
+                return HistogramCapturingExporter.HISTOGRAMS.stream()
+                    .anyMatch(name -> name.endsWith(".request.latency.histogram"));
+            }, 60_000, () -> "no request-latency histogram was pushed; got " + HistogramCapturingExporter.HISTOGRAMS);
+        }
+    }
+
+    // Decodes each pushed payload and records the names of non-empty OTLP exponential histograms in it.
+    @SuppressWarnings("unused")
+    public static class HistogramCapturingExporter extends TelemetryExporter {
+        static final Set<String> HISTOGRAMS = ConcurrentHashMap.newKeySet();
+
+        @Override
+        public ClientTelemetryExporter clientTelemetryExporter() {
+            return (context, payload) -> {
+                try {
+                    MetricsData data = MetricsData.parseFrom(payload.data());
+                    data.getResourceMetricsList().stream()
+                        .flatMap(rm -> rm.getScopeMetricsList().stream())
+                        .flatMap(sm -> sm.getMetricsList().stream())
+                        .filter(Metric::hasExponentialHistogram)
+                        .filter(m -> m.getExponentialHistogram().getDataPointsList().stream().anyMatch(p -> p.getCount() > 0))
+                        .forEach(m -> HISTOGRAMS.add(m.getName()));
+                } catch (InvalidProtocolBufferException e) {
+                    throw new RuntimeException(e);
+                }
+            };
         }
     }
 

@@ -18,7 +18,7 @@
   "type": "request",
   "listeners": ["broker"],
   "name": "GetTelemetrySubscriptionsRequest",
-  "validVersions": "0",
+  "validVersions": "0-1",
   "flexibleVersions": "0+",
   "fields": [
     {

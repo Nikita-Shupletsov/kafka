@@ -22,11 +22,15 @@ import org.apache.kafka.common.annotation.InterfaceAudience;
 import java.util.Arrays;
 
 @InterfaceAudience.Public
-public class Histogram {
+public class Histogram implements RecordingStore {
 
     private final BinScheme binScheme;
     private final float[] hist;
     private double count;
+    // Exact, unbinned aggregates of the recorded values, for snapshot().
+    private double sum;
+    private double min = Double.POSITIVE_INFINITY;
+    private double max = Double.NEGATIVE_INFINITY;
 
     public Histogram(BinScheme binScheme) {
         this.hist = new float[binScheme.bins()];
@@ -35,8 +39,39 @@ public class Histogram {
     }
 
     public void record(double value) {
-        this.hist[binScheme.toBin(value)] += 1.0f;
+        record(value, value);
+    }
+
+    // Bins binnedValue but aggregates value, so a caller that pins out-of-range values into its declared range
+    // for binning (as Percentiles does) still reports their exact sum, min and max.
+    void record(double value, double binnedValue) {
+        this.hist[binScheme.toBin(binnedValue)] += 1.0f;
         this.count += 1.0d;
+        this.sum += value;
+        this.min = Math.min(this.min, value);
+        this.max = Math.max(this.max, value);
+    }
+
+    // The interior bin boundaries of a scheme, in the form FixedHistogramWindow takes. Computed once by
+    // the owner and shared by every snapshot, rather than per sample.
+    static double[] bounds(BinScheme binScheme) {
+        double[] bounds = new double[binScheme.bins() - 1];
+        for (int i = 0; i < bounds.length; i++) {
+            bounds[i] = binScheme.fromBin(i + 1);
+        }
+        return bounds;
+    }
+
+    // An immutable copy of this histogram. bounds must be bounds(binScheme). The float bin counts are exact
+    // up to 2^24 per bin, far beyond what one sample window receives.
+    FixedHistogramWindow snapshot(double[] bounds) {
+        long[] counts = new long[this.hist.length];
+        for (int i = 0; i < counts.length; i++) {
+            counts[i] = (long) this.hist[i];
+        }
+        double snapMin = count == 0 ? Double.NaN : min;
+        double snapMax = count == 0 ? Double.NaN : max;
+        return new FixedHistogramWindow(bounds, counts, (long) count, sum, snapMin, snapMax);
     }
 
     public double value(double quantile) {
@@ -60,9 +95,17 @@ public class Histogram {
         return this.hist;
     }
 
+    // The number of values recorded, for FixedQuantileReader.
+    double count() {
+        return this.count;
+    }
+
     public void clear() {
         Arrays.fill(this.hist, 0.0f);
         this.count = 0;
+        this.sum = 0.0;
+        this.min = Double.POSITIVE_INFINITY;
+        this.max = Double.NEGATIVE_INFINITY;
     }
 
     @Override
@@ -103,10 +146,10 @@ public class Histogram {
         int toBin(double value);
 
         /**
-         * Determine the value at the upper range of the specified bin.
+         * Determine the value at the lower end of the specified bin, which is the upper end of the previous one.
          *
          * @param bin the 0-based bin number
-         * @return the value at the upper end of the bin; or {@link Float#NEGATIVE_INFINITY negative infinity}
+         * @return the value at the lower end of the bin; or {@link Float#NEGATIVE_INFINITY negative infinity}
          * if the bin number is negative or {@link Float#POSITIVE_INFINITY positive infinity} if the 0-based
          * bin number is greater than or equal to the {@link #bins() number of bins}.
          */
@@ -209,6 +252,67 @@ public class Histogram {
                 return this.bins - 1;
             } else {
                 return (int) (-0.5 + 0.5 * Math.sqrt(1.0 + 8.0 * x / this.scale));
+            }
+        }
+    }
+
+    /**
+     * A scheme where the bins are spaced geometrically (log-scale): each bin covers a constant
+     * <em>ratio</em> of values rather than a constant width, giving uniform relative precision across
+     * the whole range. This suits wide-range, non-negative quantities such as latencies and sizes,
+     * where the values of interest span orders of magnitude. Bin {@code i} covers
+     * {@code [min*ratio^i, min*ratio^(i+1))} with {@code ratio = (max/min)^(1/bins)}; values at or
+     * below {@code min} fall in bin 0 and values at or above {@code max} in the last bin. Because the
+     * mapping is logarithmic, {@code min} must be strictly positive.
+     */
+    public static class ExponentialBinScheme implements BinScheme {
+        private final int bins;
+        private final double min;
+        private final double max;
+        private final double logMin;
+        private final double logRatio;
+
+        /**
+         * @param numBins the number of bins; must be at least 2
+         * @param min the minimum trackable value; must be greater than 0
+         * @param max the maximum trackable value; must be greater than {@code min}
+         */
+        public ExponentialBinScheme(int numBins, double min, double max) {
+            if (numBins < 2)
+                throw new IllegalArgumentException("Must have at least 2 bins.");
+            if (min <= 0.0)
+                throw new IllegalArgumentException("Exponential bin scheme requires min > 0.0.");
+            if (max <= min)
+                throw new IllegalArgumentException("Exponential bin scheme requires max > min.");
+            this.bins = numBins;
+            this.min = min;
+            this.max = max;
+            this.logMin = Math.log(min);
+            this.logRatio = (Math.log(max) - logMin) / numBins;
+        }
+
+        public int bins() {
+            return this.bins;
+        }
+
+        public double fromBin(int b) {
+            if (b < 0) {
+                return Float.NEGATIVE_INFINITY;
+            } else if (b > this.bins - 1) {
+                return Float.POSITIVE_INFINITY;
+            } else {
+                return Math.exp(logMin + b * logRatio);
+            }
+        }
+
+        public int toBin(double x) {
+            if (x <= this.min) {
+                return 0;
+            } else if (x >= this.max) {
+                return this.bins - 1;
+            } else {
+                int bin = (int) ((Math.log(x) - logMin) / logRatio);
+                return Math.min(bin, this.bins - 1);
             }
         }
     }

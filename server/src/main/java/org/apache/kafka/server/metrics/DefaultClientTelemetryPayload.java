@@ -31,12 +31,16 @@ public class DefaultClientTelemetryPayload implements ClientTelemetryPayload {
     private final boolean isClientTerminating;
     private final String metricsContentType;
     private final ByteBuffer metricsData;
+    private final int partIndex;
+    private final int partCount;
 
     DefaultClientTelemetryPayload(PushTelemetryRequest request, int maxDecompressedBytes) {
         this.clientInstanceId = request.data().clientInstanceId();
         this.isClientTerminating = request.data().terminating();
         this.metricsContentType = request.metricsContentType();
         this.metricsData = request.metricsData(maxDecompressedBytes);
+        this.partIndex = request.data().partIndex();
+        this.partCount = request.data().partCount();
     }
 
     @Override
@@ -57,5 +61,15 @@ public class DefaultClientTelemetryPayload implements ClientTelemetryPayload {
     @Override
     public ByteBuffer data() {
         return metricsData;
+    }
+
+    @Override
+    public int partIndex() {
+        return partIndex;
+    }
+
+    @Override
+    public int partCount() {
+        return partCount;
     }
 }

@@ -19,6 +19,7 @@ package org.apache.kafka.clients.consumer.internals.metrics;
 import org.apache.kafka.common.MetricName;
 import org.apache.kafka.common.metrics.Metrics;
 import org.apache.kafka.common.metrics.Sensor;
+import org.apache.kafka.common.metrics.internals.LatencyPercentiles;
 import org.apache.kafka.common.metrics.stats.Avg;
 import org.apache.kafka.common.metrics.stats.Max;
 import org.apache.kafka.common.metrics.stats.Meter;
@@ -59,6 +60,9 @@ public class OffsetCommitMetricsManager extends AbstractConsumerMetricsManager {
         commitSensor.add(new Meter(new WindowedCount(),
             commitRate,
             commitTotal));
+        LatencyPercentiles.addTo(commitSensor, metrics.metricName("commit-latency",
+            metricGroupName,
+            "The distribution of time in ms taken for a commit request"), metrics.config());
     }
 
     public void recordRequestLatency(long responseLatencyMs) {

@@ -35,6 +35,8 @@ import org.apache.kafka.server.metrics.ClientMetricsConfigs;
 import org.apache.kafka.server.metrics.ClientMetricsInstance;
 import org.apache.kafka.server.metrics.ClientMetricsTestUtils;
 import org.apache.kafka.server.metrics.ClientTelemetryExporterPlugin;
+import org.apache.kafka.server.telemetry.ClientTelemetryExporter;
+import org.apache.kafka.server.telemetry.ClientTelemetryPayload;
 import org.apache.kafka.server.util.timer.SystemTimer;
 import org.apache.kafka.test.TestUtils;
 
@@ -57,7 +59,6 @@ import java.util.List;
 import java.util.Map.Entry;
 import java.util.Optional;
 import java.util.Properties;
-import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
@@ -115,7 +116,7 @@ public class ClientMetricsManagerTest {
         assertNotNull(clientMetricsManager.subscriptionInfo("sub-1"));
 
         ClientMetricsManager.SubscriptionInfo subscriptionInfo = clientMetricsManager.subscriptionInfo("sub-1");
-        Set<String> metrics = subscriptionInfo.metrics();
+        List<String> metrics = subscriptionInfo.metrics();
 
         // Validate metrics.
         assertEquals(ClientMetricsTestUtils.METRICS_TEST_DEFAULT.split(",").length, metrics.size());
@@ -187,6 +188,62 @@ public class ClientMetricsManagerTest {
         // Subscription should be removed as all properties are removed.
         assertEquals(0, clientMetricsManager.subscriptions().size());
         assertEquals(2, clientMetricsManager.subscriptionUpdateVersion());
+    }
+
+    @Test
+    public void testGetTelemetryPreservesRequestedMetricsOrder() throws Exception {
+        Properties props = ClientMetricsTestUtils.defaultTestProperties();
+        props.put(ClientMetricsConfigs.METRICS_CONFIG, "b.,a.,c.");
+        clientMetricsManager.updateSubscription("sub-order", props);
+
+        GetTelemetrySubscriptionsResponse response1 = clientMetricsManager.processGetTelemetrySubscriptionRequest(
+            new GetTelemetrySubscriptionsRequest.Builder(new GetTelemetrySubscriptionsRequestData(), true).build(),
+            ClientMetricsTestUtils.requestContext());
+        Uuid clientInstanceId = response1.data().clientInstanceId();
+        // Order is preserved end-to-end (HashSet storage would have scrambled it).
+        assertEquals(List.of("b.", "a.", "c."), response1.data().requestedMetrics());
+        int subscriptionId1 = response1.data().subscriptionId();
+
+        // Reorder the requested metrics and re-fetch as the same client instance.
+        props.put(ClientMetricsConfigs.METRICS_CONFIG, "a.,b.,c.");
+        clientMetricsManager.updateSubscription("sub-order", props);
+        time.sleep(ClientMetricsTestUtils.INTERVAL_MS_TEST_DEFAULT);
+
+        GetTelemetrySubscriptionsResponse response2 = clientMetricsManager.processGetTelemetrySubscriptionRequest(
+            new GetTelemetrySubscriptionsRequest.Builder(
+                new GetTelemetrySubscriptionsRequestData().setClientInstanceId(clientInstanceId), true).build(),
+            ClientMetricsTestUtils.requestContext());
+        assertEquals(List.of("a.", "b.", "c."), response2.data().requestedMetrics());
+        // Reordering the requested metrics (i.e. their priority) yields a new subscription id.
+        assertNotEquals(subscriptionId1, response2.data().subscriptionId());
+    }
+
+    @Test
+    public void testGetTelemetryAdvertisesTelemetryMaxParts() throws Exception {
+        try (
+                Metrics localMetrics = new Metrics();
+                ClientMetricsManager manager = new ClientMetricsManager(
+                    clientTelemetryExporterPlugin, 100, 4, time, localMetrics)
+        ) {
+            manager.updateSubscription("sub-1", ClientMetricsTestUtils.defaultTestProperties());
+
+            GetTelemetrySubscriptionsResponse response = manager.processGetTelemetrySubscriptionRequest(
+                new GetTelemetrySubscriptionsRequest.Builder(new GetTelemetrySubscriptionsRequestData(), true).build(),
+                ClientMetricsTestUtils.requestContext());
+
+            assertEquals(4, response.data().telemetryMaxParts());
+        }
+    }
+
+    @Test
+    public void testGetTelemetryDefaultsTelemetryMaxPartsToOne() throws Exception {
+        clientMetricsManager.updateSubscription("sub-1", ClientMetricsTestUtils.defaultTestProperties());
+
+        GetTelemetrySubscriptionsResponse response = clientMetricsManager.processGetTelemetrySubscriptionRequest(
+            new GetTelemetrySubscriptionsRequest.Builder(new GetTelemetrySubscriptionsRequestData(), true).build(),
+            ClientMetricsTestUtils.requestContext());
+
+        assertEquals(1, response.data().telemetryMaxParts());
     }
 
     @Test
@@ -713,6 +770,165 @@ public class ClientMetricsManagerTest {
         assertEquals((double) 0, getMetric(ClientMetricsManager.ClientMetricsStats.PLUGIN_ERROR + "-count").metricValue());
         assertNotEquals(Double.NaN, getMetric(ClientMetricsManager.ClientMetricsStats.PLUGIN_EXPORT_TIME + "-avg").metricValue());
         assertNotEquals(Double.NaN, getMetric(ClientMetricsManager.ClientMetricsStats.PLUGIN_EXPORT_TIME + "-max").metricValue());
+    }
+
+    @Test
+    public void testPushTelemetryAdmitsEachPartOfAPush() throws Exception {
+        try (
+                Metrics localMetrics = new Metrics();
+                ClientMetricsManager manager = new ClientMetricsManager(
+                    clientTelemetryExporterPlugin, 100, 3, time, localMetrics)
+        ) {
+            manager.updateSubscription("sub-1", ClientMetricsTestUtils.defaultTestProperties());
+
+            GetTelemetrySubscriptionsResponse subscriptionsResponse = manager.processGetTelemetrySubscriptionRequest(
+                new GetTelemetrySubscriptionsRequest.Builder(new GetTelemetrySubscriptionsRequestData(), true).build(),
+                ClientMetricsTestUtils.requestContext());
+            assertEquals(3, subscriptionsResponse.data().telemetryMaxParts());
+
+            Uuid clientInstanceId = subscriptionsResponse.data().clientInstanceId();
+            int subscriptionId = subscriptionsResponse.data().subscriptionId();
+
+            // The declared parts of one push are accepted back-to-back within one interval window.
+            for (int part = 0; part < 2; part++) {
+                PushTelemetryResponse response = manager.processPushTelemetryRequest(
+                    multiPartPushRequest(clientInstanceId, subscriptionId, part, 2), ClientMetricsTestUtils.requestContext());
+                assertEquals(Errors.NONE, response.error(), "push part " + part + " should be accepted");
+            }
+
+            // A repeated part, such as a retry whose first attempt had arrived, is rejected as invalid.
+            assertEquals(Errors.INVALID_REQUEST, manager.processPushTelemetryRequest(
+                multiPartPushRequest(clientInstanceId, subscriptionId, 1, 2), ClientMetricsTestUtils.requestContext()).error());
+
+            // A second push in the same window is throttled.
+            assertEquals(Errors.THROTTLING_QUOTA_EXCEEDED, manager.processPushTelemetryRequest(
+                multiPartPushRequest(clientInstanceId, subscriptionId, 0, 2), ClientMetricsTestUtils.requestContext()).error());
+
+            // Once the window elapses, pushes are accepted again.
+            time.sleep(ClientMetricsTestUtils.INTERVAL_MS_TEST_DEFAULT);
+            PushTelemetryResponse afterWindow = manager.processPushTelemetryRequest(
+                multiPartPushRequest(clientInstanceId, subscriptionId, 0, 2), ClientMetricsTestUtils.requestContext());
+            assertEquals(Errors.NONE, afterWindow.error());
+        }
+    }
+
+    @Test
+    public void testPushTelemetryRejectsInvalidParts() throws Exception {
+        try (
+                Metrics localMetrics = new Metrics();
+                ClientMetricsManager manager = new ClientMetricsManager(
+                    clientTelemetryExporterPlugin, 100, 3, time, localMetrics)
+        ) {
+            manager.updateSubscription("sub-1", ClientMetricsTestUtils.defaultTestProperties());
+            GetTelemetrySubscriptionsResponse subscriptionsResponse = manager.processGetTelemetrySubscriptionRequest(
+                new GetTelemetrySubscriptionsRequest.Builder(new GetTelemetrySubscriptionsRequestData(), true).build(),
+                ClientMetricsTestUtils.requestContext());
+            Uuid clientInstanceId = subscriptionsResponse.data().clientInstanceId();
+            int subscriptionId = subscriptionsResponse.data().subscriptionId();
+
+            // More parts than the broker advertises, an index outside the count, and a part of no open push.
+            assertEquals(Errors.INVALID_REQUEST, manager.processPushTelemetryRequest(
+                multiPartPushRequest(clientInstanceId, subscriptionId, 0, 4), ClientMetricsTestUtils.requestContext()).error());
+            assertEquals(Errors.INVALID_REQUEST, manager.processPushTelemetryRequest(
+                multiPartPushRequest(clientInstanceId, subscriptionId, 2, 2), ClientMetricsTestUtils.requestContext()).error());
+            assertEquals(Errors.INVALID_REQUEST, manager.processPushTelemetryRequest(
+                multiPartPushRequest(clientInstanceId, subscriptionId, 1, 2), ClientMetricsTestUtils.requestContext()).error());
+        }
+    }
+
+    @Test
+    public void testPushTelemetryPassesPartToExporter() throws Exception {
+        List<ClientTelemetryPayload> exported = new ArrayList<>();
+        clientTelemetryExporterPlugin.add((ClientTelemetryExporter) (context, payload) -> exported.add(payload));
+        try (
+                Metrics localMetrics = new Metrics();
+                ClientMetricsManager manager = new ClientMetricsManager(
+                    clientTelemetryExporterPlugin, 100, 3, time, localMetrics)
+        ) {
+            manager.updateSubscription("sub-1", ClientMetricsTestUtils.defaultTestProperties());
+            GetTelemetrySubscriptionsResponse subscriptionsResponse = manager.processGetTelemetrySubscriptionRequest(
+                new GetTelemetrySubscriptionsRequest.Builder(new GetTelemetrySubscriptionsRequestData(), true).build(),
+                ClientMetricsTestUtils.requestContext());
+
+            PushTelemetryRequest request = multiPartPushRequest(subscriptionsResponse.data().clientInstanceId(),
+                subscriptionsResponse.data().subscriptionId(), 0, 2);
+            assertEquals(Errors.NONE, manager.processPushTelemetryRequest(request, ClientMetricsTestUtils.requestContext()).error());
+
+            assertEquals(1, exported.size());
+            assertEquals(0, exported.get(0).partIndex());
+            assertEquals(2, exported.get(0).partCount());
+        }
+    }
+
+    @Test
+    public void testPushTelemetryPartUnderReplacedSubscriptionIsUnknownSubscription() throws Exception {
+        try (
+                Metrics localMetrics = new Metrics();
+                ClientMetricsManager manager = new ClientMetricsManager(
+                    clientTelemetryExporterPlugin, 100, 3, time, localMetrics)
+        ) {
+            manager.updateSubscription("sub-1", ClientMetricsTestUtils.defaultTestProperties());
+            GetTelemetrySubscriptionsResponse subscriptionsResponse = manager.processGetTelemetrySubscriptionRequest(
+                new GetTelemetrySubscriptionsRequest.Builder(new GetTelemetrySubscriptionsRequestData(), true).build(),
+                ClientMetricsTestUtils.requestContext());
+            Uuid clientInstanceId = subscriptionsResponse.data().clientInstanceId();
+            int subscriptionId = subscriptionsResponse.data().subscriptionId();
+            assertEquals(Errors.NONE, manager.processPushTelemetryRequest(
+                multiPartPushRequest(clientInstanceId, subscriptionId, 0, 2), ClientMetricsTestUtils.requestContext()).error());
+
+            // The subscription changes mid-push: the broker replaces the client's state, losing the open push.
+            Properties properties = new Properties();
+            properties.put("interval.ms", "100");
+            manager.updateSubscription("sub-2", properties);
+
+            // The rest of the push is told to re-subscribe, not rejected as a stray.
+            assertEquals(Errors.UNKNOWN_SUBSCRIPTION_ID, manager.processPushTelemetryRequest(
+                multiPartPushRequest(clientInstanceId, subscriptionId, 1, 2), ClientMetricsTestUtils.requestContext()).error());
+        }
+    }
+
+    @Test
+    public void testPushTelemetryPartRejectedForSizeCanBeRetried() throws Exception {
+        try (
+                Metrics localMetrics = new Metrics();
+                ClientMetricsManager manager = new ClientMetricsManager(
+                    clientTelemetryExporterPlugin, 100, 3, time, localMetrics)
+        ) {
+            manager.updateSubscription("sub-1", ClientMetricsTestUtils.defaultTestProperties());
+            GetTelemetrySubscriptionsResponse subscriptionsResponse = manager.processGetTelemetrySubscriptionRequest(
+                new GetTelemetrySubscriptionsRequest.Builder(new GetTelemetrySubscriptionsRequestData(), true).build(),
+                ClientMetricsTestUtils.requestContext());
+            Uuid clientInstanceId = subscriptionsResponse.data().clientInstanceId();
+            int subscriptionId = subscriptionsResponse.data().subscriptionId();
+            assertEquals(Errors.NONE, manager.processPushTelemetryRequest(
+                multiPartPushRequest(clientInstanceId, subscriptionId, 0, 2), ClientMetricsTestUtils.requestContext()).error());
+
+            PushTelemetryRequest tooLarge = new PushTelemetryRequest.Builder(
+                new PushTelemetryRequestData()
+                    .setClientInstanceId(clientInstanceId)
+                    .setSubscriptionId(subscriptionId)
+                    .setCompressionType(CompressionType.NONE.id)
+                    .setMetrics(ByteBuffer.wrap(new byte[101]))
+                    .setPartIndex((short) 1)
+                    .setPartCount((short) 2), true).build();
+            assertEquals(Errors.TELEMETRY_TOO_LARGE,
+                manager.processPushTelemetryRequest(tooLarge, ClientMetricsTestUtils.requestContext()).error());
+
+            // The rejected part was not admitted, so its retry is accepted rather than read as a duplicate.
+            assertEquals(Errors.NONE, manager.processPushTelemetryRequest(
+                multiPartPushRequest(clientInstanceId, subscriptionId, 1, 2), ClientMetricsTestUtils.requestContext()).error());
+        }
+    }
+
+    private PushTelemetryRequest multiPartPushRequest(Uuid clientInstanceId, int subscriptionId, int partIndex, int partCount) {
+        return new PushTelemetryRequest.Builder(
+            new PushTelemetryRequestData()
+                .setClientInstanceId(clientInstanceId)
+                .setSubscriptionId(subscriptionId)
+                .setCompressionType(CompressionType.NONE.id)
+                .setMetrics(ByteBuffer.wrap("test-data".getBytes(StandardCharsets.UTF_8)))
+                .setPartIndex((short) partIndex)
+                .setPartCount((short) partCount), true).build();
     }
 
     @Test

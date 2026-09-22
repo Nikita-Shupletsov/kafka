@@ -93,6 +93,30 @@ public final class KafkaMetric implements Metric {
     }
 
     /**
+     * Whether reporters that expose metrics over JMX should expose this metric, as its value provider declares
+     * through {@link MetricValueProvider#jmxExportable()}. Answered without computing the metric's value, so a
+     * reporter can skip the metric before ever reading it.
+     *
+     * @return true if the metric should be exposed over JMX
+     */
+    public boolean jmxExportable() {
+        return this.metricValueProvider.jmxExportable();
+    }
+
+    /**
+     * Tells the metric how often a reader will read it, so that a metric made of time windows keeps enough of
+     * them. Passes the metric's own config to {@link MetricValueProvider#retainFor(long, MetricConfig)}, under the
+     * lock the metric is recorded and read under, so the change is ordered with recording and reading.
+     *
+     * @param readIntervalMs How often the reader reads the metric, in milliseconds
+     */
+    public void retainFor(long readIntervalMs) {
+        synchronized (this.lock) {
+            metricValueProvider.retainFor(readIntervalMs, config);
+        }
+    }
+
+    /**
      * Get the underlying metric provider, which should be a {@link Measurable}
      * @return Return the metric provider
      * @throws IllegalStateException if the underlying metric is not a {@link Measurable}.

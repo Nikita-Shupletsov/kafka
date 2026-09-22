@@ -18,7 +18,7 @@ package org.apache.kafka.common.metrics;
 
 import org.apache.kafka.common.MetricName;
 import org.apache.kafka.common.annotation.InterfaceAudience;
-import org.apache.kafka.common.metrics.CompoundStat.NamedMeasurable;
+import org.apache.kafka.common.metrics.CompoundStat.NamedMetricValueProvider;
 import org.apache.kafka.common.metrics.stats.TokenBucket;
 import org.apache.kafka.common.utils.Time;
 
@@ -296,8 +296,8 @@ public final class Sensor {
         final MetricConfig statConfig = config == null ? this.config : config;
         stats.add(new StatAndConfig(Objects.requireNonNull(stat), () -> statConfig));
         Object lock = metricLock();
-        for (NamedMeasurable m : stat.stats()) {
-            final KafkaMetric metric = new KafkaMetric(lock, m.name(), m.stat(), statConfig, time);
+        for (NamedMetricValueProvider m : stat.providers()) {
+            final KafkaMetric metric = new KafkaMetric(lock, m.name(), m.metricValueProvider(), statConfig, time);
             if (!metrics.containsKey(metric.metricName())) {
                 KafkaMetric existingMetric = registry.registerMetric(metric);
                 if (existingMetric != null) {

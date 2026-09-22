@@ -19,10 +19,14 @@ package org.apache.kafka.common.telemetry.internals;
 import org.apache.kafka.common.MetricName;
 import org.apache.kafka.common.metrics.Gauge;
 import org.apache.kafka.common.metrics.KafkaMetric;
+import org.apache.kafka.common.metrics.MetricConfig;
 import org.apache.kafka.common.metrics.Metrics;
 import org.apache.kafka.common.metrics.MetricsReporter;
 import org.apache.kafka.common.metrics.Sensor;
 import org.apache.kafka.common.metrics.stats.CumulativeSum;
+import org.apache.kafka.common.metrics.stats.Percentiles;
+import org.apache.kafka.common.metrics.stats.Percentiles.BucketSizing;
+import org.apache.kafka.common.metrics.stats.RawHistogram;
 import org.apache.kafka.common.metrics.stats.WindowedCount;
 import org.apache.kafka.common.utils.MockTime;
 
@@ -35,6 +39,9 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -228,6 +235,21 @@ public class KafkaMetricsCollectorTest {
                     assertEquals(tags, intGauge.attributes());
                     assertEquals(100, intGauge.doubleValue(), 0.0);
                 });
+    }
+
+    @Test
+    public void testUnselectedMetricIsNotComputed() {
+        AtomicInteger reads = new AtomicInteger();
+        metrics.addMetric(metrics.metricName("unselected", "group1", tags), (Gauge<Double>) (config, now) -> {
+            reads.incrementAndGet();
+            return 99d;
+        });
+        testEmitter.reconfigurePredicate(key -> !key.key().name().endsWith(".unselected"));
+
+        collector.collect(testEmitter);
+
+        assertEquals(0, reads.get());
+        assertTrue(testEmitter.emittedMetrics().stream().noneMatch(m -> m.key().name().endsWith(".unselected")));
     }
 
     @Test
@@ -584,6 +606,224 @@ public class KafkaMetricsCollectorTest {
         assertEquals(1, metric.dataPointsCount());
         assertEquals(1, metric.attributesCount());
         assertEquals(Collections.singletonMap("tag1", "value1"), metric.attributes());
+    }
+
+    // The ring rotates windows by the recording clock, so histogram tests need a Metrics on the same
+    // MockTime as their collector (unlike the rate/count tests, whose Metrics must stay on a fast clock
+    // so the collector's simulated push interval does not purge their sampling windows).
+    private final class HistogramFixture {
+        final MockTime time = new MockTime(0, 1000L, TimeUnit.MILLISECONDS.toNanos(1000L));
+        final Metrics metrics = new Metrics(time);
+        final TestEmitter emitter = new TestEmitter();
+        final KafkaMetricsCollector collector =
+            new KafkaMetricsCollector(metricNamingStrategy, time, Collections.emptySet());
+        final Sensor sensor;
+
+        HistogramFixture(int maxBins) {
+            // A raw adaptive histogram with no percentiles.
+            this(base -> new Percentiles(maxBins, 8, new RawHistogram(base)));
+        }
+
+        HistogramFixture(Function<MetricName, Percentiles> stat) {
+            metrics.addReporter(new MetricsReporter() {
+                @Override
+                public void init(List<KafkaMetric> ms) {
+                    collector.init(ms);
+                }
+
+                @Override
+                public void metricChange(KafkaMetric m) {
+                    collector.metricChange(m);
+                }
+
+                @Override
+                public void metricRemoval(KafkaMetric m) {
+                    collector.metricRemoval(m);
+                }
+
+                @Override
+                public void close() {
+                }
+
+                @Override
+                public void configure(Map<String, ?> configs) {
+                }
+            });
+            MetricName base = metrics.metricName("request-latency", "group1", tags);
+            // 1s windows (via the sensor config) so the test can close windows on demand.
+            sensor = metrics.sensor("latency");
+            sensor.add(stat.apply(base), new MetricConfig().timeWindow(1, TimeUnit.SECONDS).samples(5));
+        }
+
+        SinglePointMetric collectHistogram() {
+            emitter.reset();
+            collector.collect(emitter);
+            return emitter.emittedMetrics().stream()
+                .filter(SinglePointMetric::hasExponentialHistogram).findFirst().orElseThrow();
+        }
+    }
+
+    @Test
+    public void testExponentialHistogramEmitted() {
+        HistogramFixture fixture = new HistogramFixture(40);
+        fixture.sensor.record(5.0);
+        fixture.sensor.record(15.0);
+        fixture.sensor.record(95.0);   // three observations in the first (open) window
+        fixture.time.sleep(1000);
+        fixture.sensor.record(50.0);   // rotates: closes the first window, opens the next
+
+        fixture.collector.collect(fixture.emitter);
+        List<SinglePointMetric> result = fixture.emitter.emittedMetrics();
+
+        // Exactly one exponential-histogram metric emitted, carrying the closed window.
+        List<SinglePointMetric> histograms = result.stream()
+            .filter(SinglePointMetric::hasExponentialHistogram)
+            .collect(Collectors.toList());
+        assertEquals(1, histograms.size());
+
+        SinglePointMetric hist = histograms.get(0);
+        assertEquals("test.domain.group1.request.latency", hist.key().name());
+        assertTrue(hist.isExponentialHistogramDeltaTemporality());
+        assertEquals(3L, hist.exponentialHistogramCount());   // the open window's 50.0 is not shipped
+        assertEquals(115.0, hist.exponentialHistogramSum(), 0.0);
+        assertEquals(0L, hist.exponentialHistogramZeroCount());
+        // The three positive samples all land in the positive buckets.
+        assertEquals(3L, hist.exponentialHistogramPositiveBucketCounts().stream().mapToLong(Long::longValue).sum());
+    }
+
+    @Test
+    public void testExplicitHistogramEmittedForFixedBins() {
+        // A fixed-bin store publishes its windows as an OTLP explicit-bucket histogram: 4 constant
+        // bins over [0, 100), so bounds 25, 50, 75.
+        HistogramFixture fixture = new HistogramFixture(base ->
+            new Percentiles(16, 0.0, 100.0, BucketSizing.CONSTANT, new RawHistogram(base)));
+        fixture.sensor.record(5.0);
+        fixture.sensor.record(15.0);
+        fixture.sensor.record(95.0);   // window 1
+        fixture.time.sleep(1000);
+        fixture.sensor.record(50.0);   // rotates: closes window 1
+
+        fixture.collector.collect(fixture.emitter);
+        List<SinglePointMetric> histograms = fixture.emitter.emittedMetrics().stream()
+            .filter(SinglePointMetric::hasExplicitHistogram)
+            .collect(Collectors.toList());
+        assertEquals(1, histograms.size());
+        assertTrue(fixture.emitter.emittedMetrics().stream().noneMatch(SinglePointMetric::hasExponentialHistogram));
+
+        SinglePointMetric hist = histograms.get(0);
+        assertEquals("test.domain.group1.request.latency", hist.key().name());
+        assertTrue(hist.isExplicitHistogramDeltaTemporality());
+        assertEquals(3L, hist.explicitHistogramCount());
+        assertEquals(115.0, hist.explicitHistogramSum(), 0.0);
+        assertEquals(List.of(25.0, 50.0, 75.0), hist.explicitHistogramBounds());
+        assertEquals(List.of(2L, 0L, 0L, 1L), hist.explicitHistogramBucketCounts());
+    }
+
+    @Test
+    public void testHistogramWindowsAreHeldBackWhileHistogramsMayNotBeEmitted() {
+        HistogramFixture fixture = new HistogramFixture(40);
+        fixture.sensor.record(5.0);
+        fixture.time.sleep(1000);
+        fixture.sensor.record(15.0);   // closes window 1
+        fixture.time.sleep(1000);
+        fixture.sensor.record(25.0);   // closes window 2
+
+        // An older broker: no histogram point, and the cursor stays put.
+        fixture.emitter.reset();
+        fixture.emitter.histograms(false);
+        fixture.collector.collect(fixture.emitter);
+        assertTrue(fixture.emitter.emittedMetrics().stream().noneMatch(SinglePointMetric::hasExponentialHistogram));
+
+        // A newer broker later gets both windows.
+        fixture.emitter.histograms(true);
+        assertEquals(2L, fixture.collectHistogram().exponentialHistogramCount());
+    }
+
+    @Test
+    public void testHistogramShipsDisjointWindows() {
+        HistogramFixture fixture = new HistogramFixture(40);
+        fixture.sensor.record(5.0);
+        fixture.sensor.record(15.0);
+        fixture.sensor.record(95.0);   // window 1 = {5, 15, 95}
+        fixture.time.sleep(1000);
+        fixture.sensor.record(5.0);
+        fixture.sensor.record(25.0);   // rotates: closes window 1; window 2 = {5, 25}
+
+        // First push ships the (closed) window 1.
+        SinglePointMetric first = fixture.collectHistogram();
+        assertEquals(3L, first.exponentialHistogramCount());
+
+        // Close window 2, then push again: the cursor advances so only window 2 appears (disjoint delta).
+        fixture.time.sleep(1000);
+        fixture.sensor.record(1.0);    // rotates: closes window 2
+
+        SinglePointMetric second = fixture.collectHistogram();
+        assertTrue(second.isExponentialHistogramDeltaTemporality());
+        assertEquals(2L, second.exponentialHistogramCount());   // only the 2 window-2 observations
+        assertEquals(30.0, second.exponentialHistogramSum(), 0.0);
+    }
+
+    @Test
+    public void testTemporalityResetDoesNotReshipHistogramWindows() {
+        HistogramFixture fixture = new HistogramFixture(40);
+        fixture.sensor.record(5.0);
+        fixture.sensor.record(15.0);
+        fixture.sensor.record(95.0);   // window 1 = {5, 15, 95}
+        fixture.time.sleep(1000);
+        fixture.sensor.record(5.0);
+        fixture.sensor.record(25.0);   // closes window 1; window 2 = {5, 25}
+
+        assertEquals(3L, fixture.collectHistogram().exponentialHistogramCount());   // ships window 1
+
+        // A delta/cumulative temporality flip resets ledger state. The histogram cursor must survive it,
+        // or the next push re-ships every retained window as a duplicate.
+        fixture.collector.metricsReset();
+
+        fixture.time.sleep(1000);
+        fixture.sensor.record(1.0);    // closes window 2
+
+        // Only window 2 ships — window 1 is not re-emitted.
+        assertEquals(2L, fixture.collectHistogram().exponentialHistogramCount());
+    }
+
+    @Test
+    public void testReRegistrationResetsTheHistogramCursor() {
+        HistogramFixture fixture = new HistogramFixture(40);
+        fixture.sensor.record(5.0);
+        fixture.sensor.record(15.0);
+        fixture.time.sleep(1000);
+        fixture.sensor.record(25.0);   // closes window 1 = {5, 15}
+
+        assertEquals(2L, fixture.collectHistogram().exponentialHistogramCount());   // ships window 1, advances the cursor
+
+        // Re-registering the metric clears its cursor, so every retained window counts as new again.
+        KafkaMetric histogram = fixture.metrics.metrics().values().stream()
+            .filter(m -> m.metricName().name().equals("request-latency"))
+            .findFirst().orElseThrow();
+        fixture.collector.metricChange(histogram);
+
+        fixture.time.sleep(1000);
+        fixture.sensor.record(1.0);    // closes window 2 = {25}
+        assertEquals(3L, fixture.collectHistogram().exponentialHistogramCount());   // windows 1 and 2
+    }
+
+    @Test
+    public void testExponentialHistogramSpansDecades() {
+        // Values across three decades land in one adaptive log-scale window; the scale downshifts to fit.
+        HistogramFixture fixture = new HistogramFixture(80);
+        fixture.sensor.record(10.0);
+        fixture.sensor.record(100.0);
+        fixture.sensor.record(1000.0);   // window 1
+        fixture.time.sleep(1000);
+        fixture.sensor.record(1.0);      // rotates: closes window 1
+
+        SinglePointMetric metric = fixture.collectHistogram();
+        assertEquals("test.domain.group1.request.latency", metric.key().name());
+        assertTrue(metric.isExponentialHistogramDeltaTemporality(), "histograms are emitted as delta windows");
+        assertEquals(3L, metric.exponentialHistogramCount());
+        assertEquals(1110.0, metric.exponentialHistogramSum(), 0.0);
+        assertTrue(metric.exponentialHistogramScale() > 0, "scale stays positive");
+        assertEquals(3L, metric.exponentialHistogramPositiveBucketCounts().stream().mapToLong(Long::longValue).sum());
     }
 
     private static SinglePointMetric metricByName(List<SinglePointMetric> metrics, String name) {

@@ -16,16 +16,31 @@
  */
 package org.apache.kafka.common.telemetry.internals;
 
+import org.apache.kafka.common.MetricName;
+import org.apache.kafka.common.metrics.MetricConfig;
+import org.apache.kafka.common.metrics.stats.AdaptiveHistogramWindow;
+import org.apache.kafka.common.metrics.stats.FixedHistogramWindow;
+import org.apache.kafka.common.metrics.stats.HistogramWindow;
+import org.apache.kafka.common.metrics.stats.HistogramWindows;
+import org.apache.kafka.common.metrics.stats.Percentiles;
+import org.apache.kafka.common.metrics.stats.RawHistogram;
+
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.OptionalDouble;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class SinglePointMetricTest {
@@ -224,5 +239,78 @@ public class SinglePointMetricTest {
         sum = SinglePointMetric.deltaSum(metricKey, 1.0, true, now, now, tags.keySet());
         assertEquals(1, sum.dataPointsCount());
         assertEquals(0, sum.attributesCount());
+    }
+
+    @Test
+    public void testDeltaExponentialHistogram() {
+        MetricKey key = new MetricKey("test.histogram", Collections.emptyMap());
+        // One closed window of {0, 5, 5, 40}.
+        AdaptiveHistogramWindow snapshot = assertInstanceOf(AdaptiveHistogramWindow.class,
+            closedWindow(new Percentiles(40, 5, new RawHistogram(HISTOGRAM)), 0.0, 5.0, 5.0, 40.0));
+        Instant now = Instant.ofEpochSecond(61L);
+        Instant start = Instant.ofEpochSecond(1L);
+
+        SinglePointMetric metric =
+            SinglePointMetric.deltaExponentialHistogram(key, snapshot, now, start, Collections.emptySet());
+
+        assertTrue(metric.hasExponentialHistogram());
+        assertTrue(metric.isExponentialHistogramDeltaTemporality());
+        assertEquals(snapshot.scale(), metric.exponentialHistogramScale());
+        assertEquals(4L, metric.exponentialHistogramCount());
+        assertEquals(50.0, metric.exponentialHistogramSum(), 0.0);
+        assertEquals(OptionalDouble.of(0.0), metric.exponentialHistogramMin());
+        assertEquals(OptionalDouble.of(40.0), metric.exponentialHistogramMax());
+        // The 0 is counted in the bin of 1, so every observation is in the positive range.
+        assertEquals(0L, metric.exponentialHistogramZeroCount());
+        assertEquals(snapshot.offset(), metric.exponentialHistogramPositiveOffset());
+        assertEquals(longs(snapshot.binCounts()), metric.exponentialHistogramPositiveBucketCounts());
+        assertEquals(4L, metric.exponentialHistogramPositiveBucketCounts().stream().mapToLong(Long::longValue).sum());
+        assertTrue(metric.exponentialHistogramNegativeBucketCounts().isEmpty());
+    }
+
+    @Test
+    public void testDeltaExplicitHistogram() {
+        MetricKey key = new MetricKey("test.histogram", Collections.emptyMap());
+        // Three constant bins over [0, 150): bounds 50 and 100. One closed window of {1, 20, 60, 150}, where 150 is
+        // out of range and lands in the last bin.
+        FixedHistogramWindow snapshot = assertInstanceOf(FixedHistogramWindow.class,
+            closedWindow(new Percentiles(12, 0.0, 150.0, Percentiles.BucketSizing.CONSTANT, new RawHistogram(HISTOGRAM)),
+                1.0, 20.0, 60.0, 150.0));
+        Instant now = Instant.ofEpochSecond(61L);
+        Instant start = Instant.ofEpochSecond(1L);
+
+        SinglePointMetric metric =
+            SinglePointMetric.deltaExplicitHistogram(key, snapshot, now, start, Collections.emptySet());
+
+        assertTrue(metric.hasExplicitHistogram());
+        assertTrue(metric.isExplicitHistogramDeltaTemporality());
+        assertEquals(4L, metric.explicitHistogramCount());
+        assertEquals(231.0, metric.explicitHistogramSum(), 0.0);
+        // Exact, including the out-of-range 150.
+        assertEquals(OptionalDouble.of(1.0), metric.explicitHistogramMin());
+        assertEquals(OptionalDouble.of(150.0), metric.explicitHistogramMax());
+        assertEquals(List.of(50.0, 100.0), metric.explicitHistogramBounds());
+        assertEquals(List.of(2L, 1L, 1L), metric.explicitHistogramBucketCounts());
+    }
+
+    private static final MetricName HISTOGRAM = new MetricName("latency-histogram", "group", "", Map.of());
+
+    // Records the values into one 1s window of the stat, closes it, and returns its published snapshot.
+    private static HistogramWindow closedWindow(Percentiles stat, double... values) {
+        MetricConfig config = new MetricConfig().timeWindow(1, TimeUnit.SECONDS).samples(2);
+        for (double value : values) {
+            stat.record(config, value, 0L);
+        }
+        stat.record(config, 1.0, 1000L);   // opens the next window, closing the first
+        HistogramWindows windows = (HistogramWindows) stat.providers().stream()
+            .filter(p -> p.name().equals(HISTOGRAM))
+            .findFirst().orElseThrow()
+            .metricValueProvider().value(config, 1000L);
+        assertEquals(1, windows.windows().size());
+        return windows.windows().get(0);
+    }
+
+    private static List<Long> longs(long[] values) {
+        return Arrays.stream(values).boxed().collect(Collectors.toList());
     }
 }

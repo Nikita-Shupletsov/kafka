@@ -19,7 +19,10 @@ package org.apache.kafka.coordinator.common.runtime;
 import org.apache.kafka.common.MetricName;
 import org.apache.kafka.common.metrics.CompoundStat;
 import org.apache.kafka.common.metrics.MetricConfig;
+import org.apache.kafka.common.metrics.stats.Max;
+import org.apache.kafka.common.metrics.stats.Percentile;
 import org.apache.kafka.common.metrics.stats.Percentiles;
+import org.apache.kafka.common.metrics.stats.Percentiles.BucketSizing;
 import org.apache.kafka.common.utils.Utils;
 
 import java.time.Duration;
@@ -29,22 +32,35 @@ import java.util.Map;
 import java.util.function.Function;
 
 /**
- * A compound stat providing various metrics based on an internally maintained {@link HdrHistogram}.
- * It should be more performant, more precise, and much more flexible regarding concurrent usage
- * compared to either the most commonly used in the Kafka codebase Yammer histograms or the existing
- * Kafka Metrics alternatives like {@link Percentiles}.
+ * A compound stat providing a {@code max} plus a fixed set of latency percentiles, backed by the
+ * standard Kafka Metrics histogram framework ({@link Percentiles} over geometric/log-scale bins,
+ * plus a {@link Max}). Log-scale bins give uniform <em>relative</em> precision across the whole
+ * range, which is the right model for latencies (values of interest span orders of magnitude), the
+ * same property the previous HdrHistogram-based implementation provided.
+ *
+ * <p>Because it is a {@link CompoundStat} recorded through a {@code Sensor}, updates are already
+ * serialized by the sensor lock; the percentile bins and the max share that single storage model
+ * rather than a separate concurrent data structure.
  */
 public final class KafkaMetricHistogram implements CompoundStat {
-
-    /**
-     * The number of significant digits used for the histogram.
-     */
-    public static final int NUM_SIG_FIGS = 3;
 
     /**
      * Max latency value.
      */
     public static final long MAX_LATENCY_MS = Duration.ofMinutes(1).toMillis();
+
+    /**
+     * The smallest trackable value. Log-scale bins require a strictly positive lower bound;
+     * latencies are recorded in whole milliseconds, so 1ms is the natural floor.
+     */
+    private static final double MIN_LATENCY_MS = 1.0;
+
+    /**
+     * Target relative error of the percentile bins (i.e. the width of each geometric bin).
+     * 0.25% over 1 ms to 60 s takes about 4,400 bins, close to the precision of the HdrHistogram this
+     * replaced at under a third of its memory.
+     */
+    private static final double RELATIVE_ERROR = 0.0025;
 
     /**
      * Suffix used for the histogram's max value.
@@ -66,12 +82,14 @@ public final class KafkaMetricHistogram implements CompoundStat {
      * Factory for creating a {@link MetricName} based on a metric name with suffix.
      */
     private final Function<String, MetricName> metricNameFactory;
-    private final HdrHistogram hdrHistogram;
+    private final long highestTrackableValue;
+    private final Percentiles percentiles;
+    private final Max max;
 
     /**
-     * Creates a new histogram with the purpose of tracking latency values. As such, the histogram
-     * allows concurrent reads and writes and 3-digit precision across its range (higher precision significantly
-     * increases the memory footprint of the histogram and is rarely needed).
+     * Creates a new histogram with the purpose of tracking latency values, exposing a {@code max}
+     * and the {@code p50}/{@code p95}/{@code p99}/{@code p999} percentiles over the range
+     * {@code [0, MAX_LATENCY_MS]}.
      *
      * @param metricNameFactory A factory for creating a {@link MetricName} based on a metric name
      *                          string.
@@ -80,51 +98,49 @@ public final class KafkaMetricHistogram implements CompoundStat {
     public static KafkaMetricHistogram newLatencyHistogram(
         Function<String, MetricName> metricNameFactory
     ) {
-        return new KafkaMetricHistogram(
-            metricNameFactory,
-            MAX_LATENCY_MS,
-            NUM_SIG_FIGS);
+        return new KafkaMetricHistogram(metricNameFactory, MAX_LATENCY_MS);
+    }
+
+    private KafkaMetricHistogram(
+        Function<String, MetricName> metricNameFactory,
+        long highestTrackableValue
+    ) {
+        this.metricNameFactory = metricNameFactory;
+        this.highestTrackableValue = highestTrackableValue;
+
+        Percentile[] percentileConfigs = PERCENTILE_NAMES.entrySet().stream()
+            .map(e -> new Percentile(metricNameFactory.apply(e.getValue()), e.getKey()))
+            .toArray(Percentile[]::new);
+        int bins = binsFor(MIN_LATENCY_MS, highestTrackableValue, RELATIVE_ERROR);
+        this.percentiles = new Percentiles(
+            bins * 4,
+            MIN_LATENCY_MS,
+            highestTrackableValue,
+            BucketSizing.EXPONENTIAL,
+            percentileConfigs);
+        this.max = new Max();
     }
 
     /**
-     * Creates a new histogram with the purpose of tracking latency values. As such, the histogram
-     * allows concurrent reads and writes and 3-digit precision across its range (higher precision significantly
-     * increases the memory footprint of the histogram and is rarely needed).
-     *
-     * @param metricNameFactory              A factory for creating a {@link MetricName} based on a metric name
-     *                                          string.
-     * @param highestTrackableValue          The maximum trackable value for the histogram, e.g. something
-     *                                          with some safety margin above the configured request timeout for
-     *                                          request latencies.
-     * @param numberOfSignificantValueDigits The number of significant digits used.
+     * The number of geometric bins needed to cover {@code [min, max]} with the given per-bin
+     * relative error (each bin spans a factor of {@code 1 + relativeError}).
      */
-    private KafkaMetricHistogram(
-        Function<String, MetricName> metricNameFactory,
-        long highestTrackableValue,
-        int numberOfSignificantValueDigits
-    ) {
-        this.metricNameFactory = metricNameFactory;
-        this.hdrHistogram = new HdrHistogram(highestTrackableValue, numberOfSignificantValueDigits);
+    private static int binsFor(double min, double max, double relativeError) {
+        return (int) Math.ceil(Math.log(max / min) / Math.log(1 + relativeError));
     }
 
     @Override
     public List<NamedMeasurable> stats() {
         List<NamedMeasurable> stats = new ArrayList<>();
-        stats.add(new NamedMeasurable(
-            metricNameFactory.apply(MAX_NAME),
-            (config, now) -> hdrHistogram.max(now)));
-        PERCENTILE_NAMES
-            .entrySet()
-            .stream()
-            .map(e -> new NamedMeasurable(
-                metricNameFactory.apply(e.getValue()),
-                (config, now) -> hdrHistogram.measurePercentile(now, e.getKey())))
-            .forEachOrdered(stats::add);
+        stats.add(new NamedMeasurable(metricNameFactory.apply(MAX_NAME), max));
+        stats.addAll(percentiles.stats());
         return stats;
     }
 
     @Override
     public void record(MetricConfig config, double value, long timeMs) {
-        hdrHistogram.record((long) value);
+        double capped = Math.min(Math.max(value, 0.0), highestTrackableValue);
+        percentiles.record(config, capped, timeMs);
+        max.record(config, capped, timeMs);
     }
 }

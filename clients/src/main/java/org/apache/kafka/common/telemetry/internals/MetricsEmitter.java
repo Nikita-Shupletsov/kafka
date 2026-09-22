@@ -52,6 +52,16 @@ public interface MetricsEmitter extends Closeable {
     boolean shouldEmitDeltaMetrics();
 
     /**
+     * Determines if histogram metrics may be emitted. A histogram that may not is left uncollected, so its
+     * windows are still there for a later emitter that may.
+     *
+     * @return {@code true} if histogram metrics may be emitted, {@code false} otherwise
+     */
+    default boolean shouldEmitHistograms() {
+        return true;
+    }
+
+    /**
      * Emits the metric in an implementation-specific fashion. Depending on the implementation,
      * calls made to this after {@link #close()} has been invoked will fail.
      *

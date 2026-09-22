@@ -21,6 +21,7 @@ import org.apache.kafka.clients.consumer.internals.SubscriptionState;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.metrics.MetricConfig;
 import org.apache.kafka.common.metrics.Metrics;
+import org.apache.kafka.common.metrics.internals.LatencyPercentilesTest;
 import org.apache.kafka.common.utils.MockTime;
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.common.utils.internals.LogContext;
@@ -100,6 +101,8 @@ class ConsumerRebalanceMetricsManagerTest extends AbstractConsumerMetricsManager
         assertNotNull(metrics.metric(metricsManager.rebalanceLatencyMax));
         assertNotNull(metrics.metric(metricsManager.rebalanceLatencyTotal));
         assertNotNull(metrics.metric(metricsManager.rebalanceTotal));
+        LatencyPercentilesTest.assertLatencyDistributionRegistered(metrics, "rebalance-latency",
+            metricsManager.rebalanceLatencyAvg.group(), metricsManager.rebalanceLatencyAvg.tags());
 
         // Record first rebalance (10ms duration)
         metricsManager.recordRebalanceStarted(time.milliseconds());

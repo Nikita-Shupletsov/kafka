@@ -48,6 +48,7 @@ import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.common.utils.internals.Crc32C;
 import org.apache.kafka.server.metrics.ClientMetricsConfigs;
 import org.apache.kafka.server.metrics.ClientMetricsInstance;
+import org.apache.kafka.server.metrics.ClientMetricsInstance.PushAdmission;
 import org.apache.kafka.server.metrics.ClientMetricsInstanceMetadata;
 import org.apache.kafka.server.metrics.ClientTelemetryExporterPlugin;
 import org.apache.kafka.server.network.ConnectionDisconnectListener;
@@ -64,7 +65,8 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
-import java.util.HashSet;
+import java.util.Comparator;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -96,6 +98,7 @@ public class ClientMetricsManager implements AutoCloseable {
     private final Timer expirationTimer;
     private final Map<String, SubscriptionInfo> subscriptionMap;
     private final int clientTelemetryMaxBytes;
+    private final int clientTelemetryMaxParts;
     private final Time time;
     private final int cacheExpiryMs;
     private final AtomicLong lastCacheErrorLogMs;
@@ -108,11 +111,22 @@ public class ClientMetricsManager implements AutoCloseable {
     private final AtomicInteger subscriptionUpdateVersion;
 
     public ClientMetricsManager(ClientTelemetryExporterPlugin clientTelemetryExporterPlugin, int clientTelemetryMaxBytes, Time time, Metrics metrics) {
-        this(clientTelemetryExporterPlugin, clientTelemetryMaxBytes, time, DEFAULT_CACHE_EXPIRY_MS, metrics);
+        this(clientTelemetryExporterPlugin, clientTelemetryMaxBytes, 1, time, DEFAULT_CACHE_EXPIRY_MS, metrics);
+    }
+
+    public ClientMetricsManager(ClientTelemetryExporterPlugin clientTelemetryExporterPlugin, int clientTelemetryMaxBytes,
+        int clientTelemetryMaxParts, Time time, Metrics metrics) {
+        this(clientTelemetryExporterPlugin, clientTelemetryMaxBytes, clientTelemetryMaxParts, time, DEFAULT_CACHE_EXPIRY_MS, metrics);
     }
 
     // Visible for testing
     ClientMetricsManager(ClientTelemetryExporterPlugin clientTelemetryExporterPlugin, int clientTelemetryMaxBytes, Time time, int cacheExpiryMs, Metrics metrics) {
+        this(clientTelemetryExporterPlugin, clientTelemetryMaxBytes, 1, time, cacheExpiryMs, metrics);
+    }
+
+    // Visible for testing
+    ClientMetricsManager(ClientTelemetryExporterPlugin clientTelemetryExporterPlugin, int clientTelemetryMaxBytes,
+        int clientTelemetryMaxParts, Time time, int cacheExpiryMs, Metrics metrics) {
         this.clientTelemetryExporterPlugin = clientTelemetryExporterPlugin;
         this.subscriptionMap = new ConcurrentHashMap<>();
         this.subscriptionUpdateVersion = new AtomicInteger(0);
@@ -120,6 +134,7 @@ public class ClientMetricsManager implements AutoCloseable {
         this.clientConnectionIdMap = new ConcurrentHashMap<>();
         this.expirationTimer = new SystemTimerReaper(CLIENT_METRICS_REAPER_THREAD_NAME, new SystemTimer("client-metrics"));
         this.clientTelemetryMaxBytes = clientTelemetryMaxBytes;
+        this.clientTelemetryMaxParts = clientTelemetryMaxParts;
         this.time = time;
         this.cacheExpiryMs = cacheExpiryMs;
         this.lastCacheErrorLogMs = new AtomicLong(0);
@@ -330,12 +345,21 @@ public class ClientMetricsManager implements AutoCloseable {
     private ClientMetricsInstance createClientInstance(Uuid clientInstanceId, ClientMetricsInstanceMetadata instanceMetadata) {
 
         int pushIntervalMs = ClientMetricsConfigs.INTERVAL_MS_DEFAULT;
-        // Keep a set of metrics to avoid duplicates in case of overlapping subscriptions.
-        Set<String> subscribedMetrics = new HashSet<>();
+        /*
+         Keep an order-preserving, de-duplicating set of metrics. The order is significant: it
+         defines the requested-metrics priority (most to least important) used by clients when
+         trimming over-budget telemetry, and it feeds the subscription id. To keep the union
+         deterministic across the (unordered) subscription map, iterate the matching subscriptions
+         in subscription-name order.
+        */
+        LinkedHashSet<String> subscribedMetrics = new LinkedHashSet<>();
         boolean allMetricsSubscribed = false;
 
         int currentSubscriptionVersion = subscriptionUpdateVersion.get();
-        for (SubscriptionInfo info : subscriptionMap.values()) {
+        List<SubscriptionInfo> orderedSubscriptions = subscriptionMap.values().stream()
+            .sorted(Comparator.comparing(SubscriptionInfo::name))
+            .collect(Collectors.toList());
+        for (SubscriptionInfo info : orderedSubscriptions) {
             if (instanceMetadata.isMatch(info.matchPattern())) {
                 allMetricsSubscribed = allMetricsSubscribed || info.metrics().contains(
                     ClientMetricsConfigs.ALL_SUBSCRIBED_METRICS);
@@ -354,18 +378,20 @@ public class ClientMetricsManager implements AutoCloseable {
             subscribedMetrics.add(ClientMetricsConfigs.ALL_SUBSCRIBED_METRICS);
         }
 
-        int subscriptionId = computeSubscriptionId(subscribedMetrics, pushIntervalMs, clientInstanceId);
+        List<String> subscribedMetricsList = new ArrayList<>(subscribedMetrics);
+        int subscriptionId = computeSubscriptionId(subscribedMetricsList, pushIntervalMs, clientInstanceId);
 
         return new ClientMetricsInstance(clientInstanceId, instanceMetadata, subscriptionId,
-            currentSubscriptionVersion, subscribedMetrics, pushIntervalMs);
+            currentSubscriptionVersion, subscribedMetricsList, pushIntervalMs);
     }
 
     /**
      * Computes the SubscriptionId as a unique identifier for a client instance's subscription set,
      * the id is generated by calculating a CRC32C of the configured metrics subscriptions including
-     * the PushIntervalMs, XORed with the ClientInstanceId.
+     * the PushIntervalMs, XORed with the ClientInstanceId. The metrics list is order-sensitive so
+     * that reordering the requested metrics (which changes their priority) yields a new subscription.
      */
-    private int computeSubscriptionId(Set<String> metrics, int pushIntervalMs, Uuid clientInstanceId) {
+    private int computeSubscriptionId(List<String> metrics, int pushIntervalMs, Uuid clientInstanceId) {
         byte[] metricsBytes = (metrics.toString() + pushIntervalMs).getBytes(StandardCharsets.UTF_8);
         long computedCrc = Crc32C.compute(metricsBytes, 0, metricsBytes.length);
         return (int) computedCrc ^ clientInstanceId.hashCode();
@@ -381,6 +407,7 @@ public class ClientMetricsManager implements AutoCloseable {
             .setAcceptedCompressionTypes(SUPPORTED_COMPRESSION_TYPES)
             .setPushIntervalMs(clientInstance.pushIntervalMs())
             .setTelemetryMaxBytes(clientTelemetryMaxBytes)
+            .setTelemetryMaxParts((short) clientTelemetryMaxParts)
             .setDeltaTemporality(true)
             .setErrorCode(Errors.NONE.code());
 
@@ -408,12 +435,7 @@ public class ClientMetricsManager implements AutoCloseable {
             throw new InvalidRequestException(msg);
         }
 
-        if (!clientInstance.maybeUpdatePushRequestTimestamp(timestamp) && !request.data().terminating()) {
-            clientMetricsStats.recordThrottleCount(clientInstance.clientInstanceId());
-            String msg = String.format("Request from the client [%s] arrived before the next push interval time",
-                request.data().clientInstanceId());
-            throw new ThrottlingQuotaExceededException(msg);
-        }
+        validatePushWindow(request, clientInstance, timestamp);
 
         if (request.data().subscriptionId() != clientInstance.subscriptionId()) {
             clientMetricsStats.recordUnknownSubscriptionCount();
@@ -432,6 +454,50 @@ public class ClientMetricsManager implements AutoCloseable {
             String msg = String.format("Telemetry request from [%s] is larger than the maximum allowed size [%s]",
                 request.data().clientInstanceId(), clientTelemetryMaxBytes);
             throw new TelemetryTooLargeException(msg);
+        }
+
+        /*
+         Last, so that a part is recorded as admitted only once nothing else can reject it: a part rejected for
+         another reason and then retried must not read as a duplicate. It also lets a part of a push opened under
+         a replaced subscription get UNKNOWN_SUBSCRIPTION_ID, which makes the client re-subscribe, rather than
+         being rejected as a stray.
+        */
+        admitPushPart(request, clientInstance);
+    }
+
+    /*
+     Validate the request's part fields and count it against the interval window's budget. A request at a version
+     without part fields reads as part 0 of 1. It counts even if it is rejected later, as a push always has.
+    */
+    private void validatePushWindow(PushTelemetryRequest request, ClientMetricsInstance clientInstance, long timestamp) {
+        int partIndex = request.data().partIndex();
+        int partCount = request.data().partCount();
+        if (partCount < 1 || partCount > clientTelemetryMaxParts || partIndex < 0 || partIndex >= partCount) {
+            String msg = String.format("Invalid part %d of %d from the client [%s], at most %d parts are allowed",
+                partIndex, partCount, request.data().clientInstanceId(), clientTelemetryMaxParts);
+            throw new InvalidRequestException(msg);
+        }
+
+        if (!clientInstance.maybeUpdatePushRequestTimestamp(timestamp, partIndex, clientTelemetryMaxParts,
+                request.version() >= 1) && !request.data().terminating()) {
+            clientMetricsStats.recordThrottleCount(clientInstance.clientInstanceId());
+            String msg = String.format("Request from the client [%s] arrived before the next push interval time",
+                request.data().clientInstanceId());
+            throw new ThrottlingQuotaExceededException(msg);
+        }
+    }
+
+    // Record the request as a part of its push. A duplicate or stray tells a retrying client that there is nothing
+    // left to deliver for that part.
+    private static void admitPushPart(PushTelemetryRequest request, ClientMetricsInstance clientInstance) {
+        int partIndex = request.data().partIndex();
+        int partCount = request.data().partCount();
+        PushAdmission admission = clientInstance.admitPushPart(partIndex, partCount);
+        if (admission != PushAdmission.ACCEPTED) {
+            String msg = String.format("Part %d of %d from the client [%s] is %s", partIndex, partCount,
+                request.data().clientInstanceId(),
+                admission == PushAdmission.DUPLICATE ? "a duplicate of an admitted part" : "not part of the open push");
+            throw new InvalidRequestException(msg);
         }
     }
 
@@ -500,14 +566,15 @@ public class ClientMetricsManager implements AutoCloseable {
     public static class SubscriptionInfo {
 
         private final String name;
-        private final Set<String> metrics;
+        private final List<String> metrics;
         private final int intervalMs;
         private final Map<String, Pattern> matchPattern;
 
         public SubscriptionInfo(String name, List<String> metrics, int intervalMs,
             Map<String, Pattern> matchPattern) {
             this.name = name;
-            this.metrics = new HashSet<>(metrics);
+            // Preserve the configured order (priority); the metrics config forbids duplicates.
+            this.metrics = List.copyOf(metrics);
             this.intervalMs = intervalMs;
             this.matchPattern = matchPattern;
         }
@@ -516,7 +583,7 @@ public class ClientMetricsManager implements AutoCloseable {
             return name;
         }
 
-        public Set<String> metrics() {
+        public List<String> metrics() {
             return metrics;
         }
 

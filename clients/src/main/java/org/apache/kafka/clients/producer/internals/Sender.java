@@ -42,6 +42,7 @@ import org.apache.kafka.common.errors.TransactionalIdAuthorizationException;
 import org.apache.kafka.common.errors.UnknownTopicOrPartitionException;
 import org.apache.kafka.common.message.ProduceRequestData;
 import org.apache.kafka.common.metrics.Sensor;
+import org.apache.kafka.common.metrics.internals.LatencyPercentiles;
 import org.apache.kafka.common.metrics.stats.Avg;
 import org.apache.kafka.common.metrics.stats.Max;
 import org.apache.kafka.common.metrics.stats.Meter;
@@ -1001,6 +1002,7 @@ public class Sender implements Runnable {
             this.queueTimeSensor = metrics.sensor("queue-time");
             this.queueTimeSensor.add(metrics.recordQueueTimeAvg, new Avg());
             this.queueTimeSensor.add(metrics.recordQueueTimeMax, new Max());
+            LatencyPercentiles.addTo(this.queueTimeSensor, metrics.recordQueueTimeDistribution, metrics.config());
 
             this.requestTimeSensor = metrics.sensor("request-time");
             this.requestTimeSensor.add(metrics.requestLatencyAvg, new Avg());

@@ -36,4 +36,26 @@ public interface MetricValueProvider<T> {
      */
     T value(MetricConfig config, long now);
 
+    /**
+     * Whether reporters that expose metrics over JMX should expose this metric. Most values can be exposed; one
+     * with no JMX representation, such as a raw histogram meant for client telemetry, cannot.
+     *
+     * @return true if the metric should be exposed over JMX
+     */
+    default boolean jmxExportable() {
+        return true;
+    }
+
+    /**
+     * Tells this provider how often a reader will read it. A provider whose value is a series of time windows
+     * that the reader must each see once keeps enough windows to cover {@code readIntervalMs}, so none expires
+     * between two reads. The default does nothing.
+     * Called under the lock the metric is recorded and read under.
+     *
+     * @param readIntervalMs How often the reader reads the metric, in milliseconds
+     * @param config The configuration for this metric
+     */
+    default void retainFor(long readIntervalMs, MetricConfig config) {
+    }
+
 }

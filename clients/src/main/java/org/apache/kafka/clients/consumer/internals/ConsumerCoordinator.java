@@ -54,6 +54,7 @@ import org.apache.kafka.common.message.OffsetFetchRequestData;
 import org.apache.kafka.common.metrics.Measurable;
 import org.apache.kafka.common.metrics.Metrics;
 import org.apache.kafka.common.metrics.Sensor;
+import org.apache.kafka.common.metrics.internals.LatencyPercentiles;
 import org.apache.kafka.common.metrics.stats.Avg;
 import org.apache.kafka.common.metrics.stats.Max;
 import org.apache.kafka.common.protocol.ApiKeys;
@@ -1668,6 +1669,10 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
                 metricGrpName,
                 "The max time taken for a commit request"), new Max());
             this.commitSensor.add(createMeter(metricGrpName, "commit", "commit calls"));
+            LatencyPercentiles.addTo(this.commitSensor,
+                metrics.metricName("commit-latency", metricGrpName,
+                    "The distribution of time in ms taken for a commit request"),
+                metrics.config());
 
             Measurable numParts = (config, now) -> subscriptions.numAssignedPartitions();
             metrics.addMetric(metrics.metricName("assigned-partitions",

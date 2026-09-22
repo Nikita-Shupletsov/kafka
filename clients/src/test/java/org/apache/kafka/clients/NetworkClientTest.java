@@ -1486,6 +1486,8 @@ public class NetworkClientTest {
         verify(mockClientTelemetrySender, times(1)).handleResponse(any(PushTelemetryResponse.class));
         verify(mockClientTelemetrySender, times(4)).timeToNextUpdate(anyLong());
         verify(mockClientTelemetrySender, times(2)).createRequest();
+        // Before each request the sender learns which broker it goes to, and that broker's PushTelemetry version.
+        verify(mockClientTelemetrySender, times(2)).telemetryBrokerVersion(ApiKeys.PUSH_TELEMETRY.latestVersion());
     }
 
     private RequestHeader parseHeader(ByteBuffer buffer) {

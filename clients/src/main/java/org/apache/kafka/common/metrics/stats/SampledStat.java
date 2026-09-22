@@ -60,7 +60,7 @@ public abstract class SampledStat implements MeasurableStat {
 
     private Sample advance(MetricConfig config, long timeMs) {
         // keep one extra placeholder for "overlapping sample" (see purgeObsoleteSamples() logic)
-        int maxSamples = config.samples() + 1;
+        int maxSamples = retainedSamples(config) + 1;
         this.current = (this.current + 1) % maxSamples;
         if (this.current >= samples.size()) {
             Sample sample = newSample(timeMs);
@@ -124,10 +124,16 @@ public abstract class SampledStat implements MeasurableStat {
 
     public abstract double combine(List<Sample> samples, MetricConfig config, long now);
 
+    // The number of samples the ring retains. A stat with a reader that needs more history than the stat's own
+    // measurement covers retains more; every other stat retains config.samples().
+    int retainedSamples(MetricConfig config) {
+        return config.samples();
+    }
+
     // purge any samples that lack observed events within the monitored window
     protected void purgeObsoleteSamples(MetricConfig config, long now) {
         long windowMs = this.timeWindowMs > 0 ? this.timeWindowMs : config.timeWindowMs();
-        long expireAge = config.samples() * windowMs;
+        long expireAge = (long) retainedSamples(config) * windowMs;
         for (Sample sample : samples) {
             // samples overlapping the monitored window are kept,
             // even if they started before it

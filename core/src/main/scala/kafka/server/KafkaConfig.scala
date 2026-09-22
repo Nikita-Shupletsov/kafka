@@ -307,6 +307,7 @@ class KafkaConfig private(doLog: Boolean, val props: util.Map[_, _], enforceProv
 
   /** ********* Kafka Client Telemetry Metrics Configuration ***********/
   val clientTelemetryMaxBytes: Int = getInt(MetricConfigs.CLIENT_TELEMETRY_MAX_BYTES_CONFIG)
+  val clientTelemetryMaxParts: Int = getInt(MetricConfigs.CLIENT_TELEMETRY_MAX_PARTS_CONFIG)
 
   /** ********* SSL/SASL Configuration **************/
   // Security configs may be overridden for listeners, so it is not safe to use the base values

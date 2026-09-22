@@ -21,10 +21,13 @@ import org.apache.kafka.common.metrics.Gauge;
 import org.apache.kafka.common.metrics.KafkaMetric;
 import org.apache.kafka.common.metrics.Measurable;
 import org.apache.kafka.common.metrics.MetricValueProvider;
+import org.apache.kafka.common.metrics.stats.AdaptiveHistogramWindow;
 import org.apache.kafka.common.metrics.stats.Avg;
 import org.apache.kafka.common.metrics.stats.CumulativeCount;
 import org.apache.kafka.common.metrics.stats.CumulativeSum;
+import org.apache.kafka.common.metrics.stats.FixedHistogramWindow;
 import org.apache.kafka.common.metrics.stats.Frequencies;
+import org.apache.kafka.common.metrics.stats.HistogramWindows;
 import org.apache.kafka.common.metrics.stats.Max;
 import org.apache.kafka.common.metrics.stats.Meter;
 import org.apache.kafka.common.metrics.stats.Min;
@@ -45,6 +48,7 @@ import java.util.Map.Entry;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Predicate;
 
 /**
  * All metrics implement the {@link MetricValueProvider} interface. They are divided into
@@ -161,6 +165,13 @@ public class KafkaMetricsCollector implements MetricsCollector {
     }
 
     /**
+     * Whether {@code selector} selects {@code metric}, under the telemetry name this collector emits it with.
+     */
+    public boolean selects(KafkaMetric metric, Predicate<? super MetricKeyable> selector) {
+        return selector.test(metricNamingStrategy.metricKey(metric.metricName()));
+    }
+
+    /**
      * This is called whenever temporality changes, resets the value tracker for metrics.
      */
     public void metricsReset() {
@@ -188,6 +199,12 @@ public class KafkaMetricsCollector implements MetricsCollector {
     }
 
     protected void collectMetric(MetricsEmitter metricsEmitter, MetricKey metricKey, KafkaMetric metric) {
+        // A metric the subscription does not select is not emitted, so its value is not computed either: for a
+        // histogram that would copy every closed window only to discard it.
+        if (!metricsEmitter.shouldEmitMetric(metricKey)) {
+            return;
+        }
+
         Object metricValue;
 
         try {
@@ -208,6 +225,8 @@ public class KafkaMetricsCollector implements MetricsCollector {
             } else {
                 collectGauge(metricKey, value, metricsEmitter, now);
             }
+        } else if (metricValue instanceof HistogramWindows) {
+            collectHistogramWindows(metricKey, (HistogramWindows) metricValue, metricsEmitter, now);
         } else {
             // It is non-measurable Gauge metric.
             // Collect the metric only if its value is a number.
@@ -250,6 +269,32 @@ public class KafkaMetricsCollector implements MetricsCollector {
         );
     }
 
+    private void collectHistogramWindows(MetricKey metricKey, HistogramWindows windows,
+        MetricsEmitter metricsEmitter, Instant timestamp) {
+        // The cursor stays put when histograms may not be emitted, so the windows ship once they may.
+        if (!metricsEmitter.shouldEmitHistograms()) {
+            return;
+        }
+        // Ship the closed windows newer than our cursor as one delta point, then advance the cursor to
+        // its end. The point is tagged with the windows' own [start, end] wall-clock span, so consecutive
+        // pushes tile without gap or overlap. Reading does not consume the windows — the cursor does — so
+        // a skipped or repeated read simply re-ships (or defers) the same disjoint windows. Empty when
+        // nothing new closed since the last push; then we neither emit nor move the cursor.
+        windows.mergedSince(ledger.histogramCursorMs(metricKey)).ifPresent(merged -> {
+            Instant windowStart = Instant.ofEpochMilli(merged.windowStartMs());
+            Instant windowEnd = Instant.ofEpochMilli(merged.windowEndMs());
+            // The window type follows the store: an adaptive store's windows are OTLP exponential histograms, a
+            // fixed-range store's are OTLP explicit-bucket ones.
+            metricsEmitter.emitMetric(merged instanceof AdaptiveHistogramWindow
+                ? SinglePointMetric.deltaExponentialHistogram(metricKey, (AdaptiveHistogramWindow) merged,
+                    windowEnd, windowStart, excludeLabels)
+                : SinglePointMetric.deltaExplicitHistogram(metricKey, (FixedHistogramWindow) merged,
+                    windowEnd, windowStart, excludeLabels)
+            );
+            ledger.advanceHistogramCursor(metricKey, merged.windowEndMs());
+        });
+    }
+
     /**
      * Keeps track of the state of metrics, e.g. when they were added, what their getAndSet value is,
      * and clearing them out when they're removed.
@@ -258,6 +303,10 @@ public class KafkaMetricsCollector implements MetricsCollector {
 
         private final Map<MetricKey, KafkaMetric> metricMap = new ConcurrentHashMap<>();
         private final LastValueTracker<Double> doubleDeltas = new LastValueTracker<>();
+        // End (epoch millis) of the last histogram window we shipped per key — our cursor over the ring's
+        // closed windows. We ship windows ending after it and advance it, so pushes tile the timeline
+        // without overlap or gap. Absent (treated as 0) until the first window is shipped.
+        private final Map<MetricKey, Long> histogramCursorMs = new ConcurrentHashMap<>();
         private final Map<MetricKey, Instant> metricAdded = new ConcurrentHashMap<>();
 
         private Instant instantAdded(MetricKey metricKey) {
@@ -289,6 +338,7 @@ public class KafkaMetricsCollector implements MetricsCollector {
                 */
                 doubleDeltas.remove(metricKey);
             }
+            histogramCursorMs.remove(metricKey);
             metricAdded.put(metricKey, Instant.ofEpochMilli(time.milliseconds()));
         }
 
@@ -297,6 +347,7 @@ public class KafkaMetricsCollector implements MetricsCollector {
             MetricKey metricKey = metricNamingStrategy.metricKey(metric.metricName());
             metricMap.remove(metricKey);
             doubleDeltas.remove(metricKey);
+            histogramCursorMs.remove(metricKey);
             metricAdded.remove(metricKey);
         }
 
@@ -312,9 +363,23 @@ public class KafkaMetricsCollector implements MetricsCollector {
                 .orElse(new InstantAndValue<>(instantAdded(metricKey), value));
         }
 
+        private long histogramCursorMs(MetricKey metricKey) {
+            // 0 until the first window ships, so every retained window counts as newer than the cursor.
+            return histogramCursorMs.getOrDefault(metricKey, 0L);
+        }
+
+        private void advanceHistogramCursor(MetricKey metricKey, long windowEndMs) {
+            histogramCursorMs.put(metricKey, windowEndMs);
+        }
+
         private void metricsStateReset() {
             metricAdded.clear();
             doubleDeltas.reset();
+            // Deliberately NOT clearing histogramCursorMs: this reset fires only on a delta/cumulative
+            // temporality flip, but histograms are always shipped as delta, so the flip doesn't change
+            // their emission. The cursor is a position over closed windows, not a delta baseline like
+            // doubleDeltas, so it stays valid — clearing it here would re-ship every retained window as
+            // a duplicate. The cursor is cleared where it should be: on metricChange/metricRemoval.
         }
     }
 

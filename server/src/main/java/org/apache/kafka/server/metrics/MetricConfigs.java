@@ -25,6 +25,7 @@ import java.util.List;
 
 import static org.apache.kafka.common.config.ConfigDef.Importance.LOW;
 import static org.apache.kafka.common.config.ConfigDef.Range.atLeast;
+import static org.apache.kafka.common.config.ConfigDef.Range.between;
 import static org.apache.kafka.common.config.ConfigDef.Type.INT;
 import static org.apache.kafka.common.config.ConfigDef.Type.LIST;
 import static org.apache.kafka.common.config.ConfigDef.Type.LONG;
@@ -67,6 +68,14 @@ public class MetricConfigs {
     public static final String CLIENT_TELEMETRY_MAX_BYTES_DOC = "The maximum size (after compression if compression is used) of" +
             " telemetry metrics pushed from a client to the broker. The default value is 1048576 (1 MB).";
 
+    public static final String CLIENT_TELEMETRY_MAX_PARTS_CONFIG = "telemetry.max.parts";
+    public static final int CLIENT_TELEMETRY_MAX_PARTS_DEFAULT = 1;
+    public static final int CLIENT_TELEMETRY_MAX_PARTS_MAX = 255;
+    public static final String CLIENT_TELEMETRY_MAX_PARTS_DOC = "The maximum number of PushTelemetryRequest" +
+            " parts one telemetry push from a client may span. Each part is independently bounded by" +
+            " telemetry.max.bytes. The default value is 1 (no splitting); the maximum is " +
+            CLIENT_TELEMETRY_MAX_PARTS_MAX + ".";
+
     public static final ConfigDef CONFIG_DEF =  new ConfigDef()
             // Kafka Metrics Configuration
             .define(METRIC_NUM_SAMPLES_CONFIG, INT, METRIC_NUM_SAMPLES_DEFAULT, atLeast(1), LOW, METRIC_NUM_SAMPLES_DOC)
@@ -79,5 +88,7 @@ public class MetricConfigs {
             .define(KAFKA_METRICS_POLLING_INTERVAL_SECONDS_CONFIG, INT, KAFKA_METRICS_POLLING_INTERVAL_SECONDS_DEFAULT, atLeast(1), LOW, KAFKA_METRICS_POLLING_INTERVAL_SECONDS_DOC)
 
             // Kafka Client Telemetry Metrics Configuration
-            .define(CLIENT_TELEMETRY_MAX_BYTES_CONFIG, INT, CLIENT_TELEMETRY_MAX_BYTES_DEFAULT, atLeast(1), LOW, CLIENT_TELEMETRY_MAX_BYTES_DOC);
+            .define(CLIENT_TELEMETRY_MAX_BYTES_CONFIG, INT, CLIENT_TELEMETRY_MAX_BYTES_DEFAULT, atLeast(1), LOW, CLIENT_TELEMETRY_MAX_BYTES_DOC)
+            .define(CLIENT_TELEMETRY_MAX_PARTS_CONFIG, INT, CLIENT_TELEMETRY_MAX_PARTS_DEFAULT,
+                between(1, CLIENT_TELEMETRY_MAX_PARTS_MAX), LOW, CLIENT_TELEMETRY_MAX_PARTS_DOC);
 }

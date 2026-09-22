@@ -22,6 +22,7 @@ import org.apache.kafka.common.MetricName;
 import org.apache.kafka.common.metrics.Measurable;
 import org.apache.kafka.common.metrics.Metrics;
 import org.apache.kafka.common.metrics.Sensor;
+import org.apache.kafka.common.metrics.internals.LatencyPercentiles;
 import org.apache.kafka.common.metrics.stats.Avg;
 import org.apache.kafka.common.metrics.stats.CumulativeCount;
 import org.apache.kafka.common.metrics.stats.CumulativeSum;
@@ -83,6 +84,8 @@ public final class ConsumerRebalanceMetricsManager extends RebalanceMetricsManag
         successfulRebalanceSensor.add(rebalanceLatencyTotal, new CumulativeSum());
         successfulRebalanceSensor.add(rebalanceTotal, new CumulativeCount());
         successfulRebalanceSensor.add(rebalanceRatePerHour, new Rate(TimeUnit.HOURS, new WindowedCount(), 1));
+        LatencyPercentiles.addTo(successfulRebalanceSensor, createMetric("rebalance-latency",
+                "The distribution of time in ms taken for a group to complete a rebalance"), metrics.config());
 
         failedRebalanceSensor = metrics.sensor("failed-rebalance");
         failedRebalanceSensor.add(failedRebalanceTotal, new CumulativeSum());

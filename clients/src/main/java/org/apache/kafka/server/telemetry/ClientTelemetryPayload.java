@@ -56,4 +56,23 @@ public interface ClientTelemetryPayload {
      * @return Serialized metrics data.
      */
     ByteBuffer data();
+
+    /**
+     * Method returns the zero-based index of this payload within its push. A client may split one push
+     * interval's metrics across several requests; payloads of one push arrive in index order.
+     *
+     * @return Index of this payload within its push, 0 for a push that is not split.
+     */
+    default int partIndex() {
+        return 0;
+    }
+
+    /**
+     * Method returns the number of payloads in this payload's push.
+     *
+     * @return Number of payloads in this push, 1 for a push that is not split.
+     */
+    default int partCount() {
+        return 1;
+    }
 }

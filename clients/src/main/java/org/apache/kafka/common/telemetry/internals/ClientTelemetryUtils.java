@@ -37,10 +37,12 @@ import java.io.OutputStream;
 import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.function.Predicate;
 
 import io.opentelemetry.proto.metrics.v1.MetricsData;
@@ -121,6 +123,43 @@ public class ClientTelemetryUtils {
             log.debug("Telemetry subscription has specified to include only metrics that are prefixed with the following strings: {}", requestedMetrics);
             return k -> requestedMetrics.stream().anyMatch(f -> k.key().name().startsWith(f));
         }
+    }
+
+    /**
+     * Builds a deterministic priority ordering for telemetry metrics based on the requested-metrics
+     * list order (most to least important). A metric's family rank is the index of the earliest
+     * (highest-priority) requested prefix that its name starts with; metrics that match no prefix,
+     * or when the subscription conveys no family order ({@code "*"} / empty), fall back to a rank of
+     * {@link Integer#MAX_VALUE}. Ties are broken by metric name, then by tags, so the order is stable
+     * across intervals and across instances that share a subscription. Lower compares first (higher
+     * priority, kept when trimming).
+     */
+    public static Comparator<SinglePointMetric> priorityComparator(List<String> requestedMetrics) {
+        return Comparator
+            .comparingInt((SinglePointMetric metric) -> familyRank(metric.key().name(), requestedMetrics))
+            .thenComparing(metric -> metric.key().name())
+            .thenComparing(ClientTelemetryUtils::tagsKey);
+    }
+
+    private static int familyRank(String name, List<String> requestedMetrics) {
+        if (requestedMetrics == null) {
+            return Integer.MAX_VALUE;
+        }
+        for (int i = 0; i < requestedMetrics.size(); i++) {
+            String prefix = requestedMetrics.get(i);
+            if (prefix == null || prefix.isEmpty() || prefix.equals("*")) {
+                // The all-metrics subscription conveys no family order.
+                continue;
+            }
+            if (name.startsWith(prefix)) {
+                return i;
+            }
+        }
+        return Integer.MAX_VALUE;
+    }
+
+    private static String tagsKey(SinglePointMetric metric) {
+        return new TreeMap<>(metric.key().tags()).toString();
     }
 
     public static List<CompressionType> getCompressionTypesFromAcceptedList(List<Byte> acceptedCompressionTypes) {

@@ -32,6 +32,9 @@ import org.apache.kafka.common.message.GetTelemetrySubscriptionsResponseData;
 import org.apache.kafka.common.message.PushTelemetryRequestData;
 import org.apache.kafka.common.message.PushTelemetryResponseData;
 import org.apache.kafka.common.metrics.KafkaMetricsContext;
+import org.apache.kafka.common.metrics.MetricConfig;
+import org.apache.kafka.common.metrics.MetricValueProvider;
+import org.apache.kafka.common.metrics.Metrics;
 import org.apache.kafka.common.metrics.MetricsContext;
 import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.common.record.internal.CompressionType;
@@ -55,14 +58,18 @@ import org.mockito.internal.stubbing.answers.CallsRealMethods;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Predicate;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -520,6 +527,464 @@ public class ClientTelemetryReporterTest {
         }
     }
 
+    @Test
+    public void testPartitionGroupsSplitsAndTrimsByPriority() {
+        clientTelemetryReporter.configure(configs);
+        clientTelemetryReporter.contextChange(metricsContext);
+        ClientTelemetryReporter.DefaultClientTelemetrySender telemetrySender =
+            (ClientTelemetryReporter.DefaultClientTelemetrySender) clientTelemetryReporter.telemetrySender();
+
+        Instant now = Instant.ofEpochMilli(0);
+        SinglePointMetric a = SinglePointMetric.gauge(new MetricKey("a.m"), 1.0, now, Set.of());
+        SinglePointMetric b = SinglePointMetric.gauge(new MetricKey("b.m"), 1.0, now, Set.of());
+        SinglePointMetric c = SinglePointMetric.gauge(new MetricKey("c.m"), 1.0, now, Set.of());
+        List<String> requested = List.of("a.", "b.", "c.");
+
+        int oneMetricBytes = telemetrySender.serializedContribution(a);
+
+        // Budget fits exactly one metric per part; with only 2 parts and 3 metrics, the lowest-priority
+        // metric (c) is dropped. Input order is deliberately scrambled to prove priority ordering.
+        List<List<SinglePointMetric>> groups = telemetrySender.partitionGroups(
+            List.of(c, a, b), oneMetricBytes, 2, requested);
+
+        assertEquals(2, groups.size());
+        assertEquals(List.of("a.m"), names(groups.get(0)));
+        assertEquals(List.of("b.m"), names(groups.get(1)));
+    }
+
+    @Test
+    public void testPartitionGroupsPacksMultiplePerPartWhenBudgetAllows() {
+        clientTelemetryReporter.configure(configs);
+        clientTelemetryReporter.contextChange(metricsContext);
+        ClientTelemetryReporter.DefaultClientTelemetrySender telemetrySender =
+            (ClientTelemetryReporter.DefaultClientTelemetrySender) clientTelemetryReporter.telemetrySender();
+
+        Instant now = Instant.ofEpochMilli(0);
+        SinglePointMetric a = SinglePointMetric.gauge(new MetricKey("a.m"), 1.0, now, Set.of());
+        SinglePointMetric b = SinglePointMetric.gauge(new MetricKey("b.m"), 1.0, now, Set.of());
+        SinglePointMetric c = SinglePointMetric.gauge(new MetricKey("c.m"), 1.0, now, Set.of());
+        List<String> requested = List.of("a.", "b.", "c.");
+
+        int oneMetricBytes = telemetrySender.serializedContribution(a);
+
+        // Budget fits two metrics per part, and enough parts are allowed to keep everything.
+        List<List<SinglePointMetric>> groups = telemetrySender.partitionGroups(
+            List.of(a, b, c), oneMetricBytes * 2, 5, requested);
+
+        assertEquals(2, groups.size());
+        assertEquals(List.of("a.m", "b.m"), names(groups.get(0)));
+        assertEquals(List.of("c.m"), names(groups.get(1)));
+    }
+
+    @Test
+    public void testPartitionGroupsFillsPartWithMetricsAfterOneThatDoesNotFit() {
+        clientTelemetryReporter.configure(configs);
+        clientTelemetryReporter.contextChange(metricsContext);
+        ClientTelemetryReporter.DefaultClientTelemetrySender telemetrySender =
+            (ClientTelemetryReporter.DefaultClientTelemetrySender) clientTelemetryReporter.telemetrySender();
+
+        Instant now = Instant.ofEpochMilli(0);
+        int oneMetricBytes = telemetrySender.serializedContribution(
+            SinglePointMetric.gauge(new MetricKey("a.m"), 1.0, now, Set.of()));
+        SinglePointMetric big = SinglePointMetric.gauge(new MetricKey("f." + "x".repeat(5 * oneMetricBytes)), 1.0, now, Set.of());
+        int bigBytes = telemetrySender.serializedContribution(big);
+        assertTrue(bigBytes > 4 * oneMetricBytes && bigBytes <= 9 * oneMetricBytes);
+
+        List<SinglePointMetric> metrics = new ArrayList<>();
+        for (String name : List.of("a.m", "b.m", "c.m", "d.m", "e.m", "g.m", "h.m", "i.m", "j.m")) {
+            metrics.add(SinglePointMetric.gauge(new MetricKey(name), 1.0, now, Set.of()));
+        }
+        metrics.add(big);
+
+        // The big metric does not fit after the first five, so the four after it fill the first part
+        // and the big metric starts the second.
+        List<List<SinglePointMetric>> groups = telemetrySender.partitionGroups(
+            metrics, 9 * oneMetricBytes, 2, List.of());
+
+        assertEquals(2, groups.size());
+        assertEquals(List.of("a.m", "b.m", "c.m", "d.m", "e.m", "g.m", "h.m", "i.m", "j.m"), names(groups.get(0)));
+        assertEquals(List.of(big.key().name()), names(groups.get(1)));
+
+        // With a single part, only the big metric is dropped.
+        groups = telemetrySender.partitionGroups(metrics, 9 * oneMetricBytes, 1, List.of());
+
+        assertEquals(1, groups.size());
+        assertEquals(List.of("a.m", "b.m", "c.m", "d.m", "e.m", "g.m", "h.m", "i.m", "j.m"), names(groups.get(0)));
+    }
+
+    @Test
+    public void testPartitionGroupsDropsMetricThatDoesNotFitEvenAnEmptyPart() {
+        clientTelemetryReporter.configure(configs);
+        clientTelemetryReporter.contextChange(metricsContext);
+        ClientTelemetryReporter.DefaultClientTelemetrySender telemetrySender =
+            (ClientTelemetryReporter.DefaultClientTelemetrySender) clientTelemetryReporter.telemetrySender();
+
+        Instant now = Instant.ofEpochMilli(0);
+        SinglePointMetric a = SinglePointMetric.gauge(new MetricKey("a.m"), 1.0, now, Set.of());
+        SinglePointMetric b = SinglePointMetric.gauge(new MetricKey("b.m"), 1.0, now, Set.of());
+        int oneMetricBytes = telemetrySender.serializedContribution(a);
+        SinglePointMetric big = SinglePointMetric.gauge(new MetricKey("ab." + "x".repeat(2 * oneMetricBytes)), 1.0, now, Set.of());
+
+        // The big metric exceeds the budget on its own. It is dropped without using up the other parts.
+        List<List<SinglePointMetric>> groups = telemetrySender.partitionGroups(
+            List.of(a, big, b), 2 * oneMetricBytes, 5, List.of());
+
+        assertEquals(1, groups.size());
+        assertEquals(List.of("a.m", "b.m"), names(groups.get(0)));
+
+        // Nothing fits at all: no parts.
+        assertEquals(List.of(), telemetrySender.partitionGroups(List.of(big), 2 * oneMetricBytes, 5, List.of()));
+    }
+
+    @Test
+    public void testMultiPartPushEmitsPartsBackToBackWithinWindow() {
+        clientTelemetryReporter.configure(configs);
+        clientTelemetryReporter.contextChange(metricsContext);
+        ClientTelemetryReporter.DefaultClientTelemetrySender telemetrySender =
+            (ClientTelemetryReporter.DefaultClientTelemetrySender) clientTelemetryReporter.telemetrySender();
+
+        Instant now = Instant.ofEpochMilli(0);
+        int oneMetricBytes = telemetrySender.serializedContribution(
+            SinglePointMetric.gauge(new MetricKey("a.m"), 1.0, now, Set.of()));
+
+        // 3 parts allowed, one metric per part.
+        ClientTelemetryReporter.ClientTelemetrySubscription subscription =
+            new ClientTelemetryReporter.ClientTelemetrySubscription(uuid, 1234, 20000,
+                List.of(CompressionType.NONE), true, ClientTelemetryUtils.SELECTOR_ALL_METRICS,
+                oneMetricBytes, 3, List.of("*"));
+        telemetrySender.updateSubscriptionResult(subscription, time.milliseconds());
+
+        KafkaMetricsCollector collector = Mockito.mock(KafkaMetricsCollector.class);
+        Mockito.doAnswer(invocation -> {
+            MetricsEmitter emitter = invocation.getArgument(0);
+            emitter.emitMetric(SinglePointMetric.gauge(new MetricKey("a.m"), 1.0, now, Set.of()));
+            emitter.emitMetric(SinglePointMetric.gauge(new MetricKey("b.m"), 1.0, now, Set.of()));
+            emitter.emitMetric(SinglePointMetric.gauge(new MetricKey("c.m"), 1.0, now, Set.of()));
+            return null;
+        }).when(collector).collect(Mockito.any());
+        clientTelemetryReporter.metricsCollector(collector);
+
+        assertTrue(telemetrySender.maybeSetState(ClientTelemetryState.SUBSCRIPTION_IN_PROGRESS));
+        assertTrue(telemetrySender.maybeSetState(ClientTelemetryState.PUSH_NEEDED));
+
+        // Part 1 collected and emitted; two more parts buffered.
+        Optional<AbstractRequest.Builder<?>> part1 = telemetrySender.createRequest();
+        assertTrue(part1.isPresent());
+        assertInstanceOf(PushTelemetryRequest.class, part1.get().build());
+        assertPart(part1, 0, 3);
+        assertEquals(ClientTelemetryState.PUSH_IN_PROGRESS, telemetrySender.state());
+        telemetrySender.handleResponse(pushSuccess());
+        // Parts remain, so the next part must be sent immediately (interval 0).
+        assertEquals(ClientTelemetryState.PUSH_NEEDED, telemetrySender.state());
+        assertEquals(0, telemetrySender.intervalMs());
+
+        // Part 2 comes from the buffer (no new collect).
+        Optional<AbstractRequest.Builder<?>> part2 = telemetrySender.createRequest();
+        assertTrue(part2.isPresent());
+        assertPart(part2, 1, 3);
+        telemetrySender.handleResponse(pushSuccess());
+        assertEquals(0, telemetrySender.intervalMs());
+
+        // Part 3 is the last buffered part; the window is now drained.
+        Optional<AbstractRequest.Builder<?>> part3 = telemetrySender.createRequest();
+        assertTrue(part3.isPresent());
+        assertPart(part3, 2, 3);
+        telemetrySender.handleResponse(pushSuccess());
+        assertEquals(20000, telemetrySender.intervalMs());
+
+        // The snapshot was collected exactly once for the whole multi-part window.
+        Mockito.verify(collector, Mockito.times(1)).collect(Mockito.any());
+    }
+
+    @Test
+    public void testNetworkFailureRetriesThePartAtOnce() {
+        ClientTelemetryReporter.DefaultClientTelemetrySender telemetrySender = threePartPushSender();
+        KafkaMetricsCollector collector = (KafkaMetricsCollector) clientTelemetryReporter.metricsCollector();
+
+        assertPart(telemetrySender.createRequest(), 0, 3);
+        telemetrySender.handleResponse(pushSuccess());
+        assertPart(telemetrySender.createRequest(), 1, 3);
+        telemetrySender.handleFailedPushTelemetryRequest(new KafkaException(new DisconnectException()));
+
+        // The failed part is sent again straight away, within the same push, followed by the rest of it.
+        assertEquals(ClientTelemetryState.PUSH_NEEDED, telemetrySender.state());
+        assertEquals(0, telemetrySender.intervalMs());
+        assertPart(telemetrySender.createRequest(), 1, 3);
+        telemetrySender.handleResponse(pushSuccess());
+        assertPart(telemetrySender.createRequest(), 2, 3);
+        telemetrySender.handleResponse(pushSuccess());
+        assertEquals(20000, telemetrySender.intervalMs(), "the next push waits for its interval");
+        Mockito.verify(collector, Mockito.times(1)).collect(Mockito.any());
+    }
+
+    @Test
+    public void testThrottledPartDropsTheRestOfThePush() {
+        ClientTelemetryReporter.DefaultClientTelemetrySender telemetrySender = threePartPushSender();
+        KafkaMetricsCollector collector = (KafkaMetricsCollector) clientTelemetryReporter.metricsCollector();
+
+        assertPart(telemetrySender.createRequest(), 0, 3);
+        telemetrySender.handleResponse(pushSuccess());
+        assertPart(telemetrySender.createRequest(), 1, 3);
+        telemetrySender.handleResponse(pushError(Errors.THROTTLING_QUOTA_EXCEEDED));
+        assertEquals(ClientTelemetryState.SUBSCRIPTION_NEEDED, telemetrySender.state());
+
+        // Nothing of the throttled push is kept: the next request is a new push.
+        resubscribe(telemetrySender, 1234);
+        assertPart(telemetrySender.createRequest(), 0, 3);
+        Mockito.verify(collector, Mockito.times(2)).collect(Mockito.any());
+    }
+
+    @Test
+    public void testRetriedPartRejectedAsInvalidCountsAsDelivered() {
+        ClientTelemetryReporter.DefaultClientTelemetrySender telemetrySender = threePartPushSender();
+
+        assertPart(telemetrySender.createRequest(), 0, 3);
+        telemetrySender.handleResponse(pushSuccess());
+        assertPart(telemetrySender.createRequest(), 1, 3);
+        telemetrySender.handleFailedPushTelemetryRequest(new KafkaException(new DisconnectException()));
+
+        // The response to the first attempt was lost but the part had arrived: the broker reports a duplicate.
+        assertPart(telemetrySender.createRequest(), 1, 3);
+        telemetrySender.handleResponse(pushError(Errors.INVALID_REQUEST));
+        assertEquals(ClientTelemetryState.PUSH_NEEDED, telemetrySender.state());
+        assertEquals(0, telemetrySender.intervalMs());
+        assertPart(telemetrySender.createRequest(), 2, 3);
+    }
+
+    @Test
+    public void testPartThatFailsTwiceDropsTheRestOfThePush() {
+        ClientTelemetryReporter.DefaultClientTelemetrySender telemetrySender = threePartPushSender();
+        KafkaMetricsCollector collector = (KafkaMetricsCollector) clientTelemetryReporter.metricsCollector();
+
+        assertPart(telemetrySender.createRequest(), 0, 3);
+        telemetrySender.handleResponse(pushSuccess());
+        assertPart(telemetrySender.createRequest(), 1, 3);
+        telemetrySender.handleFailedPushTelemetryRequest(new KafkaException(new DisconnectException()));
+        assertPart(telemetrySender.createRequest(), 1, 3);
+        telemetrySender.handleFailedPushTelemetryRequest(new KafkaException(new DisconnectException()));
+        assertEquals(ClientTelemetryState.SUBSCRIPTION_NEEDED, telemetrySender.state());
+
+        // Part 2 is never sent; the next request is a new push.
+        resubscribe(telemetrySender, 1234);
+        assertPart(telemetrySender.createRequest(), 0, 3);
+        Mockito.verify(collector, Mockito.times(2)).collect(Mockito.any());
+    }
+
+    @Test
+    public void testFailedFirstPartIsNotRetried() {
+        ClientTelemetryReporter.DefaultClientTelemetrySender telemetrySender = threePartPushSender();
+        KafkaMetricsCollector collector = (KafkaMetricsCollector) clientTelemetryReporter.metricsCollector();
+
+        // A broker that did receive part 0 would take a second index 0 for a new push, so the push is dropped.
+        assertPart(telemetrySender.createRequest(), 0, 3);
+        telemetrySender.handleFailedPushTelemetryRequest(new KafkaException(new DisconnectException()));
+        assertEquals(ClientTelemetryState.SUBSCRIPTION_NEEDED, telemetrySender.state());
+
+        resubscribe(telemetrySender, 1234);
+        assertPart(telemetrySender.createRequest(), 0, 3);
+        Mockito.verify(collector, Mockito.times(2)).collect(Mockito.any());
+    }
+
+    @Test
+    public void testNonRetriableErrorResponseDropsTheBacklog() {
+        ClientTelemetryReporter.DefaultClientTelemetrySender telemetrySender = threePartPushSender();
+
+        assertPart(telemetrySender.createRequest(), 0, 3);
+        telemetrySender.handleResponse(pushSuccess());
+        assertPart(telemetrySender.createRequest(), 1, 3);
+        telemetrySender.handleResponse(pushError(Errors.UNKNOWN_SUBSCRIPTION_ID));
+        // Same subscription id, so only the error can have dropped the rest of the push.
+        resubscribe(telemetrySender, 1234);
+
+        assertPart(telemetrySender.createRequest(), 0, 3);
+        Mockito.verify((KafkaMetricsCollector) clientTelemetryReporter.metricsCollector(), Mockito.times(2))
+            .collect(Mockito.any());
+    }
+
+    @Test
+    public void testNonRetriableFailureDropsTheBacklog() {
+        ClientTelemetryReporter.DefaultClientTelemetrySender telemetrySender = threePartPushSender();
+
+        assertPart(telemetrySender.createRequest(), 0, 3);
+        telemetrySender.handleResponse(pushSuccess());
+        assertPart(telemetrySender.createRequest(), 1, 3);
+        telemetrySender.handleFailedPushTelemetryRequest(new KafkaException("not retriable"));
+        resubscribe(telemetrySender, 1234);
+
+        assertPart(telemetrySender.createRequest(), 0, 3);
+        Mockito.verify((KafkaMetricsCollector) clientTelemetryReporter.metricsCollector(), Mockito.times(2))
+            .collect(Mockito.any());
+    }
+
+    @Test
+    public void testSubscriptionChangeDropsAKeptPart() {
+        ClientTelemetryReporter.DefaultClientTelemetrySender telemetrySender = threePartPushSender();
+
+        assertPart(telemetrySender.createRequest(), 0, 3);
+        telemetrySender.handleResponse(pushSuccess());
+        assertPart(telemetrySender.createRequest(), 1, 3);
+        telemetrySender.handleFailedPushTelemetryRequest(new KafkaException(new DisconnectException()));
+        // Kept for retry, but the subscription changes before it is sent: its id would be rejected.
+        telemetrySender.updateSubscriptionResult(
+            threePartSubscription(5678, telemetrySender.subscription().maxBytes()), time.milliseconds());
+
+        assertPart(telemetrySender.createRequest(), 0, 3);
+        Mockito.verify((KafkaMetricsCollector) clientTelemetryReporter.metricsCollector(), Mockito.times(2))
+            .collect(Mockito.any());
+    }
+
+    @Test
+    public void testSinglePartPushIsNotRetried() {
+        clientTelemetryReporter.configure(configs);
+        clientTelemetryReporter.contextChange(metricsContext);
+        ClientTelemetryReporter.DefaultClientTelemetrySender telemetrySender =
+            (ClientTelemetryReporter.DefaultClientTelemetrySender) clientTelemetryReporter.telemetrySender();
+        telemetrySender.updateSubscriptionResult(new ClientTelemetryReporter.ClientTelemetrySubscription(uuid, 1234,
+            20000, List.of(CompressionType.NONE), true, ClientTelemetryUtils.SELECTOR_ALL_METRICS,
+            1024 * 1024, 1, List.of("*")), time.milliseconds());
+        KafkaMetricsCollector collector = Mockito.mock(KafkaMetricsCollector.class);
+        clientTelemetryReporter.metricsCollector(collector);
+        assertTrue(telemetrySender.maybeSetState(ClientTelemetryState.SUBSCRIPTION_IN_PROGRESS));
+        assertTrue(telemetrySender.maybeSetState(ClientTelemetryState.PUSH_NEEDED));
+
+        assertPart(telemetrySender.createRequest(), 0, 1);
+        telemetrySender.handleResponse(pushError(Errors.THROTTLING_QUOTA_EXCEEDED));
+        resubscribe(telemetrySender, 1234);
+        assertPart(telemetrySender.createRequest(), 0, 1);
+        Mockito.verify(collector, Mockito.times(2)).collect(Mockito.any());
+    }
+
+    @Test
+    public void testHistogramsAreEmittedOnlyToABrokerAtPushTelemetryVersionOne() {
+        ClientTelemetryReporter.DefaultClientTelemetrySender telemetrySender = threePartPushSender();
+        KafkaMetricsCollector collector = (KafkaMetricsCollector) clientTelemetryReporter.metricsCollector();
+        List<Boolean> histogramsAllowed = new ArrayList<>();
+        Mockito.doAnswer(invocation -> {
+            histogramsAllowed.add(invocation.<MetricsEmitter>getArgument(0).shouldEmitHistograms());
+            return null;
+        }).when(collector).collect(Mockito.any());
+
+        telemetrySender.telemetryBrokerVersion((short) 0);
+        telemetrySender.createRequest();
+        telemetrySender.handleResponse(pushSuccess());
+
+        telemetrySender.telemetryBrokerVersion((short) 1);
+        telemetrySender.createRequest();
+        assertEquals(List.of(false, true), histogramsAllowed);
+    }
+
+    @Test
+    public void testSinglePartPushIsTrimmedToTelemetryMaxBytes() {
+        // TelemetryMaxParts is 1, as from a broker that does not advertise it: the push is one request, trimmed to
+        // the limit rather than sent whole and rejected.
+        ClientTelemetryReporter.DefaultClientTelemetrySender telemetrySender = threePartPushSender();
+        int oneMetricBytes = telemetrySender.subscription().maxBytes();
+        telemetrySender.updateSubscriptionResult(new ClientTelemetryReporter.ClientTelemetrySubscription(uuid, 1234,
+            20000, List.of(CompressionType.NONE), true, ClientTelemetryUtils.SELECTOR_ALL_METRICS,
+            oneMetricBytes, 1, List.of("*")), time.milliseconds());
+
+        Optional<AbstractRequest.Builder<?>> request = telemetrySender.createRequest();
+        assertPart(request, 0, 1);
+        assertTrue(payloadBytes(request) <= oneMetricBytes, "the push fits TelemetryMaxBytes");
+        assertTrue(payloadBytes(request) > 0, "the highest-priority metric that fits is kept");
+    }
+
+    @Test
+    public void testTerminatingPushIsTrimmedToTelemetryMaxBytes() {
+        ClientTelemetryReporter.DefaultClientTelemetrySender telemetrySender = threePartPushSender();
+        int oneMetricBytes = telemetrySender.subscription().maxBytes();
+        telemetrySender.initiateClose();
+
+        Optional<AbstractRequest.Builder<?>> request = telemetrySender.createRequest();
+        assertPart(request, 0, 1);
+        assertTrue(((PushTelemetryRequest) request.get().build()).data().terminating());
+        assertTrue(payloadBytes(request) <= oneMetricBytes, "the terminating push fits TelemetryMaxBytes");
+    }
+
+    @Test
+    public void testPushIsSentEmptyWhenNoMetricFits() {
+        ClientTelemetryReporter.DefaultClientTelemetrySender telemetrySender = threePartPushSender();
+        telemetrySender.updateSubscriptionResult(new ClientTelemetryReporter.ClientTelemetrySubscription(uuid, 1234,
+            20000, List.of(CompressionType.NONE), true, ClientTelemetryUtils.SELECTOR_ALL_METRICS,
+            1, 3, List.of("*")), time.milliseconds());
+
+        Optional<AbstractRequest.Builder<?>> request = telemetrySender.createRequest();
+        assertPart(request, 0, 1);
+        assertEquals(0, payloadBytes(request));
+    }
+
+    // The size of a push request's metrics payload, as sent: uncompressed, since these subscriptions accept only NONE.
+    private static int payloadBytes(Optional<AbstractRequest.Builder<?>> request) {
+        return ((PushTelemetryRequest) request.get().build()).data().metrics().remaining();
+    }
+
+    @Test
+    public void testPushToSinglePartBrokerIsNotSplit() {
+        // The subscription allows three parts, but the broker the push goes to is known to be at version 0.
+        ClientTelemetryReporter.DefaultClientTelemetrySender telemetrySender = threePartPushSender();
+        telemetrySender.telemetryBrokerVersion((short) 0);
+        assertPart(telemetrySender.createRequest(), 0, 1);
+    }
+
+    // A sender subscribed for three parts of one metric each, with a collector emitting three metrics.
+    private ClientTelemetryReporter.DefaultClientTelemetrySender threePartPushSender() {
+        clientTelemetryReporter.configure(configs);
+        clientTelemetryReporter.contextChange(metricsContext);
+        ClientTelemetryReporter.DefaultClientTelemetrySender telemetrySender =
+            (ClientTelemetryReporter.DefaultClientTelemetrySender) clientTelemetryReporter.telemetrySender();
+
+        Instant now = Instant.ofEpochMilli(0);
+        int oneMetricBytes = telemetrySender.serializedContribution(
+            SinglePointMetric.gauge(new MetricKey("a.m"), 1.0, now, Set.of()));
+        telemetrySender.updateSubscriptionResult(threePartSubscription(1234, oneMetricBytes), time.milliseconds());
+
+        KafkaMetricsCollector collector = Mockito.mock(KafkaMetricsCollector.class);
+        Mockito.doAnswer(invocation -> {
+            MetricsEmitter emitter = invocation.getArgument(0);
+            emitter.emitMetric(SinglePointMetric.gauge(new MetricKey("a.m"), 1.0, now, Set.of()));
+            emitter.emitMetric(SinglePointMetric.gauge(new MetricKey("b.m"), 1.0, now, Set.of()));
+            emitter.emitMetric(SinglePointMetric.gauge(new MetricKey("c.m"), 1.0, now, Set.of()));
+            return null;
+        }).when(collector).collect(Mockito.any());
+        clientTelemetryReporter.metricsCollector(collector);
+
+        assertTrue(telemetrySender.maybeSetState(ClientTelemetryState.SUBSCRIPTION_IN_PROGRESS));
+        assertTrue(telemetrySender.maybeSetState(ClientTelemetryState.PUSH_NEEDED));
+        return telemetrySender;
+    }
+
+    private ClientTelemetryReporter.ClientTelemetrySubscription threePartSubscription(int subscriptionId, int maxBytes) {
+        return new ClientTelemetryReporter.ClientTelemetrySubscription(uuid, subscriptionId, 20000,
+            List.of(CompressionType.NONE), true, ClientTelemetryUtils.SELECTOR_ALL_METRICS, maxBytes, 3, List.of("*"));
+    }
+
+    // What a fresh GetTelemetrySubscriptions round trip does to the sender, keeping the part budget.
+    private void resubscribe(ClientTelemetryReporter.DefaultClientTelemetrySender telemetrySender, int subscriptionId) {
+        assertTrue(telemetrySender.maybeSetState(ClientTelemetryState.SUBSCRIPTION_IN_PROGRESS));
+        assertTrue(telemetrySender.maybeSetState(ClientTelemetryState.PUSH_NEEDED));
+        telemetrySender.updateSubscriptionResult(
+            threePartSubscription(subscriptionId, telemetrySender.subscription().maxBytes()), time.milliseconds());
+    }
+
+    private static void assertPart(Optional<AbstractRequest.Builder<?>> request, int partIndex, int partCount) {
+        assertTrue(request.isPresent());
+        PushTelemetryRequestData data = ((PushTelemetryRequest) request.get().build()).data();
+        assertEquals(partIndex, data.partIndex(), "part index");
+        assertEquals(partCount, data.partCount(), "part count");
+    }
+
+    private static PushTelemetryResponse pushSuccess() {
+        return new PushTelemetryResponse(new PushTelemetryResponseData().setErrorCode(Errors.NONE.code()));
+    }
+
+    private static PushTelemetryResponse pushError(Errors error) {
+        return new PushTelemetryResponse(new PushTelemetryResponseData().setErrorCode(error.code()));
+    }
+
+    private static List<String> names(List<SinglePointMetric> metrics) {
+        return metrics.stream().map(metric -> metric.key().name()).collect(java.util.stream.Collectors.toList());
+    }
+
     /**
      * Builds a {@link Compression.Builder} whose stream raises an {@link IOException} while writing the
      * payload, so that {@link ClientTelemetryUtils#compress} surfaces a recoverable compression failure.
@@ -559,6 +1024,48 @@ public class ClientTelemetryReporterTest {
         assertEquals(Collections.singletonList(CompressionType.GZIP), subscription.acceptedCompressionTypes());
         assertEquals(20000, subscription.pushIntervalMs());
         assertEquals(ClientTelemetryUtils.SELECTOR_ALL_METRICS, subscription.selector());
+    }
+
+    @Test
+    public void testHandleResponseParsesMaxBytesAndMaxParts() {
+        ClientTelemetryReporter.DefaultClientTelemetrySender telemetrySender = (ClientTelemetryReporter.DefaultClientTelemetrySender) clientTelemetryReporter.telemetrySender();
+        assertTrue(telemetrySender.maybeSetState(ClientTelemetryState.SUBSCRIPTION_IN_PROGRESS));
+
+        GetTelemetrySubscriptionsResponse response = new GetTelemetrySubscriptionsResponse(
+            new GetTelemetrySubscriptionsResponseData()
+                .setClientInstanceId(Uuid.randomUuid())
+                .setSubscriptionId(5678)
+                .setAcceptedCompressionTypes(Collections.singletonList(CompressionType.GZIP.id))
+                .setPushIntervalMs(20000)
+                .setTelemetryMaxBytes(1000)
+                .setTelemetryMaxParts((short) 4)
+                .setRequestedMetrics(List.of("org.apache.kafka.a.", "org.apache.kafka.b.")));
+
+        telemetrySender.handleResponse(response);
+
+        ClientTelemetryReporter.ClientTelemetrySubscription subscription = telemetrySender.subscription();
+        assertNotNull(subscription);
+        assertEquals(1000, subscription.maxBytes());
+        assertEquals(4, subscription.maxParts());
+        assertEquals(List.of("org.apache.kafka.a.", "org.apache.kafka.b."), subscription.requestedMetrics());
+    }
+
+    @Test
+    public void testHandleResponseDefaultsMaxPartsToOneForOldBroker() {
+        ClientTelemetryReporter.DefaultClientTelemetrySender telemetrySender = (ClientTelemetryReporter.DefaultClientTelemetrySender) clientTelemetryReporter.telemetrySender();
+        assertTrue(telemetrySender.maybeSetState(ClientTelemetryState.SUBSCRIPTION_IN_PROGRESS));
+
+        // A v0 broker never sets TelemetryMaxParts; the field defaults to 1 (single-part).
+        GetTelemetrySubscriptionsResponse response = new GetTelemetrySubscriptionsResponse(
+            new GetTelemetrySubscriptionsResponseData()
+                .setClientInstanceId(Uuid.randomUuid())
+                .setSubscriptionId(5678)
+                .setAcceptedCompressionTypes(Collections.singletonList(CompressionType.GZIP.id))
+                .setPushIntervalMs(20000)
+                .setRequestedMetrics(Collections.singletonList("*")));
+
+        telemetrySender.handleResponse(response);
+        assertEquals(1, telemetrySender.subscription().maxParts());
     }
 
     @Test
@@ -1047,6 +1554,51 @@ public class ClientTelemetryReporterTest {
             new UnsupportedVersionException("Version not supported"));
         assertEquals(ClientTelemetryState.SUBSCRIPTION_NEEDED, telemetrySender.state());
         assertFalse(telemetrySender.enabled());
+    }
+
+    @Test
+    public void testSelectedMetricsAreToldThePushInterval() {
+        clientTelemetryReporter.configure(configs);
+        clientTelemetryReporter.contextChange(metricsContext);
+        try (Metrics metrics = new Metrics(new MetricConfig(), List.of(clientTelemetryReporter), time)) {
+            RecordingRetention selected = new RecordingRetention();
+            metrics.addMetric(metrics.metricName("selected", "group"), selected);
+            RecordingRetention unselected = new RecordingRetention();
+            metrics.addMetric(metrics.metricName("unselected", "group"), unselected);
+            assertEquals(0L, selected.lastReadIntervalMs);
+
+            Predicate<? super MetricKeyable> selectsOne = key -> key.key().name().endsWith(".selected");
+            clientTelemetryReporter.retainForPushInterval(300_000, selectsOne);
+            assertEquals(300_000L, selected.lastReadIntervalMs);
+            assertEquals(0L, unselected.lastReadIntervalMs, "a metric the subscription does not select is not told");
+
+            // A changed interval is passed on; whether to shrink is the provider's call.
+            clientTelemetryReporter.retainForPushInterval(60_000, selectsOne);
+            assertEquals(60_000L, selected.lastReadIntervalMs);
+
+            // A metric registered after the subscription is told the current interval on registration, if selected.
+            RecordingRetention later = new RecordingRetention();
+            metrics.addMetric(metrics.metricName("later.selected", "group"), later);
+            assertEquals(60_000L, later.lastReadIntervalMs);
+
+            // A later subscription that selects everything reaches the metric the first one did not.
+            clientTelemetryReporter.retainForPushInterval(60_000, ClientTelemetryUtils.SELECTOR_ALL_METRICS);
+            assertEquals(60_000L, unselected.lastReadIntervalMs);
+        }
+    }
+
+    private static final class RecordingRetention implements MetricValueProvider<Double> {
+        long lastReadIntervalMs;
+
+        @Override
+        public Double value(MetricConfig config, long now) {
+            return 0.0;
+        }
+
+        @Override
+        public void retainFor(long readIntervalMs, MetricConfig config) {
+            lastReadIntervalMs = readIntervalMs;
+        }
     }
 
     @AfterEach

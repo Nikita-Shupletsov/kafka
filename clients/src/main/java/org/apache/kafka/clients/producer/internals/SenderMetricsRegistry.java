@@ -19,8 +19,10 @@ package org.apache.kafka.clients.producer.internals;
 import org.apache.kafka.common.MetricName;
 import org.apache.kafka.common.MetricNameTemplate;
 import org.apache.kafka.common.metrics.Measurable;
+import org.apache.kafka.common.metrics.MetricConfig;
 import org.apache.kafka.common.metrics.Metrics;
 import org.apache.kafka.common.metrics.Sensor;
+import org.apache.kafka.common.metrics.internals.LatencyPercentiles;
 
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
@@ -39,6 +41,7 @@ public class SenderMetricsRegistry {
     public final MetricName compressionRateAvg;
     public final MetricName recordQueueTimeAvg;
     public final MetricName recordQueueTimeMax;
+    public final LatencyPercentiles.Names recordQueueTimeDistribution;
     public final MetricName requestLatencyAvg;
     public final MetricName requestLatencyMax;   
     public final MetricName produceThrottleTimeAvg;
@@ -89,6 +92,10 @@ public class SenderMetricsRegistry {
                 "The average time in ms record batches spent in the send buffer.");
         this.recordQueueTimeMax = createMetricName("record-queue-time-max",
                 "The maximum time in ms record batches spent in the send buffer.");
+        LatencyPercentiles.Templates recordQueueTime = LatencyPercentiles.templates("record-queue-time",
+                KafkaProducerMetrics.GROUP, "the time in ms record batches spent in the send buffer", this.tags);
+        this.allTemplates.addAll(recordQueueTime.all());
+        this.recordQueueTimeDistribution = recordQueueTime.instantiate(template -> this.metrics.metricInstance(template));
         this.requestLatencyAvg = createMetricName("request-latency-avg", 
                 "The average request latency in ms");
         this.requestLatencyMax = createMetricName("request-latency-max", 
@@ -207,6 +214,10 @@ public class SenderMetricsRegistry {
 
     public void addMetric(MetricName m, Measurable measurable) {
         this.metrics.addMetric(m, measurable);
+    }
+
+    public MetricConfig config() {
+        return this.metrics.config();
     }
 
     public Sensor getSensor(String name) {

@@ -17,6 +17,7 @@
 package org.apache.kafka.clients.consumer.internals;
 
 import org.apache.kafka.common.MetricNameTemplate;
+import org.apache.kafka.common.metrics.internals.LatencyPercentiles;
 
 import java.util.HashSet;
 import java.util.Set;
@@ -37,6 +38,7 @@ public class ShareFetchMetricsRegistry {
     public MetricNameTemplate acknowledgementErrorTotal;
     public MetricNameTemplate fetchLatencyAvg;
     public MetricNameTemplate fetchLatencyMax;
+    public LatencyPercentiles.Templates fetchLatencyDistribution;
     public MetricNameTemplate fetchRequestRate;
     public MetricNameTemplate fetchRequestTotal;
     public MetricNameTemplate fetchThrottleTimeAvg;
@@ -87,6 +89,8 @@ public class ShareFetchMetricsRegistry {
                 "The average time taken for a fetch request.", tags);
         this.fetchLatencyMax = new MetricNameTemplate("fetch-latency-max", groupName,
                 "The max time taken for any fetch request.", tags);
+        this.fetchLatencyDistribution = LatencyPercentiles.templates("fetch-latency", groupName,
+                "the time taken for a share fetch request", tags);
         this.fetchRequestRate = new MetricNameTemplate("fetch-rate", groupName,
                 "The number of fetch requests per second.", tags);
         this.fetchRequestTotal = new MetricNameTemplate("fetch-total", groupName,

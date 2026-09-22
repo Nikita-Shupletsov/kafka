@@ -17,6 +17,7 @@
 package org.apache.kafka.clients.consumer.internals.metrics;
 
 import org.apache.kafka.common.metrics.Metrics;
+import org.apache.kafka.common.metrics.internals.LatencyPercentilesTest;
 import org.apache.kafka.common.utils.MockTime;
 import org.apache.kafka.common.utils.Time;
 
@@ -46,6 +47,8 @@ public class OffsetCommitMetricsManagerTest extends AbstractConsumerMetricsManag
         assertNotNull(metrics.metric(metricsManager.commitLatencyMax));
         assertNotNull(metrics.metric(metricsManager.commitRate));
         assertNotNull(metrics.metric(metricsManager.commitTotal));
+        LatencyPercentilesTest.assertLatencyDistributionRegistered(metrics, "commit-latency",
+            metricsManager.commitLatencyAvg.group(), metricsManager.commitLatencyAvg.tags());
 
         // Record request latency
         metricsManager.recordRequestLatency(100);
